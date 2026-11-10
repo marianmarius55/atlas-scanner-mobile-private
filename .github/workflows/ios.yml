@@ -13,20 +13,12 @@ jobs:
       - name: Show Xcode
         run: xcodebuild -version && xcodebuild -showsdks | grep -i iphoneos
 
-      - name: Get Insta360 frameworks (private release asset)
+      - name: Get Insta360 SDK zip (private release asset)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download x --repo "$GITHUB_REPOSITORY" --pattern 'iOS-SDK-V1.11.3.zip' --dir /tmp
-          # Extract only the four frameworks the app uses.
-          unzip -q /tmp/iOS-SDK-V1.11.3.zip 'iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks/*' -d /tmp/sdk
-          FW=/tmp/sdk/iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks
-          mkdir -p mobile/AtlasMobile/Frameworks
-          for f in INSCameraSDK INSCameraServiceSDK INSCoreMedia SSZipArchive; do
-            cp -R "$FW/$f.xcframework" mobile/AtlasMobile/Frameworks/
-          done
-          rm -rf /tmp/sdk /tmp/iOS-SDK-V1.11.3.zip
-          ls mobile/AtlasMobile/Frameworks
+          ls -la /tmp/iOS-SDK-V1.11.3.zip
 
       - name: Install XcodeGen where setup_ios.sh expects it
         run: |
@@ -38,7 +30,7 @@ jobs:
 
       - name: Fetch OpenCV and generate project
         working-directory: mobile/AtlasMobile
-        run: bash setup_ios.sh
+        run: bash setup_ios.sh --sdk-dir /tmp/iOS-SDK-V1.11.3.zip
 
       - name: Build
         working-directory: mobile/AtlasMobile
