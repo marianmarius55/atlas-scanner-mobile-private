@@ -1,0 +1,695 @@
+import SwiftUI
+import ARKit
+
+struct CaptureOverlayView: View {
+    @EnvironmentObject var sessionManager: CaptureSessionManager
+    @State private var showFlash = false
+    @State private var showCalibration = false
+    @State private var showConnectionLog = false
+
+    var body: some View {
+        ZStack {
+            // Depth overlay (tap anywhere to dismiss)
+            if sessionManager.showDepthOverlay,
+               let depthImage = sessionManager.depthOverlayImage {
+                GeometryReader { geo in
+                    DepthOverlayUIView(image: depthImage)
+                        .frame(
+                            width: geo.size.width,
+                            height: geo.size.height
+                        )
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(true)
+                .onTapGesture { sessionManager.toggleDepthOverlay() }
+            }
+
+            // Capture flash
+            if showFlash {
+                Color.white
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+
+            VStack {
+                VStack(spacing: 6) {
+                    // ── Status row: tracking, disk, scan count ──
+                    HStack(spacing: 6) {
+                        TrackingStateBadge(
+                            state: sessionManager.trackingState
+                        )
+
+                        Spacer()
+
+                        DiskSpaceBadge(
+                            freeGB: sessionManager.freeSpaceGB
+                        )
+
+                        Text("Scans: \(sessionManager.scanCount)")
+                            .font(.system(
+                                .headline,
+                                design: .monospaced
+                            ))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(8)
+                    }
+
+                    // ── Warnings row: speed + motion side by side ──
+                    let showSpeed =
+                        sessionManager.speedMps > 0.5
+                    let showMotion =
+                        sessionManager.connectedCameraCount > 0
+                    if showSpeed || showMotion {
+                        HStack(spacing: 6) {
+                            if showSpeed {
+                                SpeedWarningBadge(
+                                    speedMps: sessionManager
+                                        .speedMps
+                                )
+                            }
+                            if showMotion {
+                                X5MotionBadge(
+                                    angularRateDps: sessionManager
+                                        .smoothedAngularRateDps,
+                                    holdSteady: sessionManager
+                                        .x5HoldSteady
+                                )
+                            }
+                        }
+                    }
+
+                    // ── Camera status row ──
+                    if let status = sessionManager.cameraStatus {
+                        HStack(spacing: 6) {
+                            Label(
+                                status,
+                                systemImage: cameraIcon
+                            )
+                            .font(.caption.weight(.medium))
+                            .foregroundColor(cameraStatusColor)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(8)
+
+                            if showRetryButton {
+                                Button {
+                                    sessionManager
+                                        .retryInsta360Connection()
+                                } label: {
+                                    Label(
+                                        "Retry",
+                                        systemImage:
+                                            "arrow.clockwise"
+                                    )
+                                    .font(
+                                        .caption.weight(.medium)
+                                    )
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        .ultraThinMaterial
+                                    )
+                                    .cornerRadius(8)
+                                }
+                            }
+
+                            if !sessionManager.isPipelineReady
+                                && !sessionManager
+                                    .connectedCamerasList
+                                    .isEmpty
+                            {
+                                HStack(spacing: 4) {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                    Text("Warming up\u{2026}")
+                                        .font(
+                                            .caption
+                                                .weight(.medium)
+                                        )
+                                        .foregroundColor(.orange)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(8)
+                            }
+
+                            Spacer()
+
+                            if !sessionManager.connectionLog
+                                .isEmpty
+                            {
+                                Button {
+                                    showConnectionLog.toggle()
+                                } label: {
+                                    Image(
+                                        systemName:
+                                            "doc.text"
+                                            + ".magnifyingglass"
+                                    )
+                                    .font(.caption)
+                                    .foregroundColor(.white)
+                                    .padding(6)
+                                    .background(
+                                        .ultraThinMaterial
+                                    )
+                                    .clipShape(Circle())
+                                }
+                            }
+                        }
+                    }
+
+                    if showConnectionLog {
+                        VStack(spacing: 4) {
+                            HStack {
+                                Text("Connection Log")
+                                    .font(.system(
+                                        size: 10,
+                                        weight: .bold,
+                                        design: .monospaced
+                                    ))
+                                    .foregroundColor(
+                                        .white.opacity(0.7)
+                                    )
+                                Spacer()
+                                Button {
+                                    UIPasteboard
+                                        .general.string =
+                                        sessionManager
+                                        .connectionLog
+                                        .joined(
+                                            separator: "\n"
+                                        )
+                                } label: {
+                                    Label(
+                                        "Copy",
+                                        systemImage:
+                                            "doc.on.doc"
+                                    )
+                                    .font(.system(
+                                        size: 10,
+                                        weight: .medium
+                                    ))
+                                    .foregroundColor(.white)
+                                    .padding(
+                                        .horizontal, 8
+                                    )
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        .white.opacity(0.2)
+                                    )
+                                    .cornerRadius(4)
+                                }
+                            }
+                            ScrollView {
+                                VStack(
+                                    alignment: .leading,
+                                    spacing: 2
+                                ) {
+                                    ForEach(
+                                        Array(
+                                            sessionManager
+                                                .connectionLog
+                                                .suffix(50)
+                                                .enumerated()
+                                        ),
+                                        id: \.offset
+                                    ) { _, line in
+                                        Text(line)
+                                            .font(.system(
+                                                size: 10,
+                                                design:
+                                                    .monospaced
+                                            ))
+                                            .foregroundColor(
+                                                .white
+                                            )
+                                    }
+                                }
+                                .frame(
+                                    maxWidth: .infinity,
+                                    alignment: .leading
+                                )
+                            }
+                        }
+                        .frame(maxHeight: 200)
+                        .padding(8)
+                        .background(.black.opacity(0.7))
+                        .cornerRadius(8)
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                Spacer()
+
+                // Bottom: thumbnails + capture button + controls
+                HStack(alignment: .bottom) {
+                    // Thumbnails
+                    VStack(spacing: 6) {
+                        if let thumb = sessionManager.lastCapturedThumbnail {
+                            ThumbnailView(image: thumb, label: "iPhone")
+                                .id("iphone-\(sessionManager.thumbnailVersion)")
+                        }
+                        if let erp = sessionManager.lastInstaERP {
+                            ThumbnailView(image: erp, label: "360")
+                                .id("insta-\(sessionManager.thumbnailVersion)")
+                        }
+                        if sessionManager.lastCapturedThumbnail == nil
+                            && sessionManager.lastInstaERP == nil {
+                            Color.clear.frame(width: 80, height: 80)
+                        }
+                    }
+
+                    Spacer()
+
+                    // Capture button
+                    if sessionManager.isAutoCapturing {
+                        Button {
+                            Task { await sessionManager.stopAutoCapture() }
+                        } label: {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(.red)
+                                    .frame(width: 40, height: 40)
+                                Circle()
+                                    .stroke(.white, lineWidth: 4)
+                                    .frame(width: 82, height: 82)
+                            }
+                        }
+                    } else {
+                        Button {
+                            Task { await sessionManager.captureScan() }
+                        } label: {
+                            ZStack {
+                                Circle()
+                                    .fill(.white)
+                                    .frame(width: 72, height: 72)
+                                Circle()
+                                    .stroke(.white, lineWidth: 4)
+                                    .frame(width: 82, height: 82)
+                            }
+                        }
+                        .disabled(!sessionManager.isReadyToCapture)
+                        .opacity(sessionManager.isReadyToCapture ? 1.0 : 0.5)
+                    }
+
+                    Spacer()
+
+                    VStack(spacing: 8) {
+                        // Auto/Manual capture toggle
+                        Button {
+                            if sessionManager.isAutoCapturing {
+                                Task { await sessionManager.stopAutoCapture() }
+                            } else {
+                                sessionManager.startAutoCapture()
+                            }
+                        } label: {
+                            Text(sessionManager.isAutoCapturing ? "AUTO" : "MAN")
+                                .font(.caption2.weight(.bold))
+                                .foregroundColor(sessionManager.isAutoCapturing ? .black : .white)
+                                .frame(width: 44, height: 44)
+                                .background(
+                                    sessionManager.isAutoCapturing
+                                        ? AnyShapeStyle(.green)
+                                        : AnyShapeStyle(.ultraThinMaterial)
+                                )
+                                .clipShape(Circle())
+                        }
+
+                        ForEach(
+                            sessionManager.connectedCamerasList
+                        ) { cam in
+                            let on = sessionManager
+                                .isCameraEnabled(cam.id)
+                            Button {
+                                sessionManager
+                                    .toggleCamera(cam.id)
+                            } label: {
+                                Text(cam.id)
+                                    .font(
+                                        .system(
+                                            size: 9,
+                                            weight: .bold,
+                                            design: .monospaced
+                                        )
+                                    )
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.6)
+                                    .foregroundColor(
+                                        on ? .black : .white
+                                    )
+                                    .frame(
+                                        width: 44, height: 44
+                                    )
+                                    .background(
+                                        on
+                                            ? AnyShapeStyle(
+                                                .green
+                                            )
+                                            : AnyShapeStyle(
+                                                .ultraThinMaterial
+                                            )
+                                    )
+                                    .clipShape(Circle())
+                            }
+                        }
+
+                        // Visualization toggles
+                        VisToggle(icon: "square.3.layers.3d", active: sessionManager.showMesh) {
+                            sessionManager.toggleMesh()
+                        }
+                        VisToggle(icon: "circle.dotted", active: sessionManager.showPointCloud) {
+                            sessionManager.togglePointCloud()
+                        }
+                        VisToggle(
+                            icon: sessionManager.showDepthOverlay ? "xmark" : "camera.filters",
+                            active: sessionManager.showDepthOverlay
+                        ) {
+                            sessionManager.toggleDepthOverlay()
+                        }
+
+                        // Quick calibration check
+                        if sessionManager.connectedCameraCount > 0 {
+                            Button {
+                                Task {
+                                    await sessionManager
+                                        .quickCalibrationCheck()
+                                }
+                            } label: {
+                                ZStack {
+                                    Image(systemName: "eye.circle")
+                                        .font(.title3)
+                                        .foregroundColor(
+                                            sessionManager.isCheckingCalib
+                                                ? .yellow : .white
+                                        )
+                                        .frame(width: 44, height: 44)
+                                        .background(.ultraThinMaterial)
+                                        .clipShape(Circle())
+                                    if sessionManager.isCheckingCalib {
+                                        ProgressView()
+                                            .tint(.white)
+                                            .scaleEffect(0.6)
+                                    }
+                                }
+                            }
+                            .disabled(sessionManager.isCheckingCalib)
+                        }
+
+                        // Full calibration view
+                        Button { showCalibration = true } label: {
+                            Image(systemName: "scope")
+                                .font(.title3)
+                                .foregroundColor(.white)
+                                .frame(width: 44, height: 44)
+                                .background(.ultraThinMaterial)
+                                .clipShape(Circle())
+                        }
+
+                        // End session
+                        Button {
+                            Task { await sessionManager.endSession() }
+                        } label: {
+                            Text("End")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundColor(.white)
+                                .frame(width: 60, height: 60)
+                                .background(.red.opacity(0.8))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 30)
+            }
+        }
+        .overlay {
+            if sessionManager.showCalibCheck,
+               let calibImage = sessionManager.calibCheckImage {
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    Image(uiImage: calibImage)
+                        .resizable()
+                        .scaledToFit()
+                        .ignoresSafeArea()
+                    VStack {
+                        HStack {
+                            Button {
+                                sessionManager.dismissCalibCheck()
+                            } label: {
+                                Label("Close", systemImage: "xmark.circle.fill")
+                                    .font(.headline)
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+                                    .background(.black.opacity(0.7))
+                                    .cornerRadius(20)
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, 60)
+                        .padding(.leading, 20)
+                        Spacer()
+                    }
+                }
+                .onTapGesture { sessionManager.dismissCalibCheck() }
+                .transition(.opacity)
+            }
+        }
+        .sheet(isPresented: $showCalibration) {
+            NavigationStack {
+                CalibrationView()
+            }
+        }
+        .onChange(of: sessionManager.captureFlash) { _, flashing in
+            guard flashing else { return }
+            withAnimation(.easeIn(duration: 0.05)) { showFlash = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                withAnimation(.easeOut(duration: 0.2)) { showFlash = false }
+                sessionManager.captureFlash = false
+            }
+        }
+    }
+
+    private var showRetryButton: Bool {
+        guard let status = sessionManager.cameraStatus else { return false }
+        return status.contains("No cameras") || status.contains("disconnected")
+    }
+
+    private var cameraIcon: String {
+        guard let status = sessionManager.cameraStatus else { return "camera" }
+        if status.contains("Connecting") || status.contains("Retrying") {
+            return "antenna.radiowaves.left.and.right"
+        }
+        if status.contains("No cameras") || status.contains("disconnected") {
+            return "exclamationmark.triangle"
+        }
+        return "camera.fill"
+    }
+
+    private var cameraStatusColor: Color {
+        guard let status = sessionManager.cameraStatus else { return .white }
+        if status.contains("Connecting") || status.contains("Retrying") { return .yellow }
+        if status.contains("No cameras") || status.contains("disconnected") { return .red }
+        if status.contains("/") { return .yellow }
+        return .green
+    }
+}
+
+private struct ThumbnailView: View {
+    let image: UIImage
+    let label: String
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 80, height: 80)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(.white, lineWidth: 2)
+                )
+                .shadow(radius: 4)
+
+            Text(label)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 3)
+                .padding(.vertical, 1)
+                .background(.black.opacity(0.6))
+                .cornerRadius(3)
+                .padding(3)
+        }
+    }
+}
+
+private struct VisToggle: View {
+    let icon: String
+    let active: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.callout)
+                .foregroundColor(active ? .yellow : .white)
+                .frame(width: 40, height: 40)
+                .background(.ultraThinMaterial)
+                .overlay(active ? Color.yellow.opacity(0.2) : Color.clear)
+                .clipShape(Circle())
+        }
+    }
+}
+
+private struct TrackingStateBadge: View {
+    let state: ARCamera.TrackingState
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 10, height: 10)
+            Text(label)
+                .font(.caption.weight(.medium))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial)
+        .cornerRadius(8)
+    }
+
+    private var color: Color {
+        switch state {
+        case .normal:
+            return .green
+        case .limited:
+            return .yellow
+        case .notAvailable:
+            return .red
+        @unknown default:
+            return .gray
+        }
+    }
+
+    private var label: String {
+        switch state {
+        case .normal:
+            return "Tracking"
+        case .limited(let reason):
+            switch reason {
+            case .initializing:
+                return "Initializing"
+            case .excessiveMotion:
+                return "Too fast"
+            case .insufficientFeatures:
+                return "Low features"
+            case .relocalizing:
+                return "Relocalizing"
+            @unknown default:
+                return "Limited"
+            }
+        case .notAvailable:
+            return "Not available"
+        @unknown default:
+            return "Unknown"
+        }
+    }
+}
+
+private struct DiskSpaceBadge: View {
+    let freeGB: Double
+
+    var body: some View {
+        let color: Color = freeGB < 1 ? .red
+            : freeGB < 5 ? .yellow : .white
+        Text(String(format: "%.1f GB", freeGB))
+            .font(.system(.caption, design: .monospaced))
+            .fontWeight(.medium)
+            .foregroundColor(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial)
+            .cornerRadius(8)
+    }
+}
+
+private struct SpeedWarningBadge: View {
+    let speedMps: Double
+
+    var body: some View {
+        let severity: Color = speedMps > 1.0 ? .red : .yellow
+        HStack(spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2)
+            Text("Slow down")
+                .font(.caption.weight(.bold))
+        }
+        .foregroundColor(severity)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(severity.opacity(0.15))
+        .background(.ultraThinMaterial)
+        .cornerRadius(8)
+    }
+}
+
+private struct X5MotionBadge: View {
+    let angularRateDps: Double
+    let holdSteady: Bool
+
+    private var icon: String {
+        holdSteady ? "hand.raised.fill"
+            : angularRateDps < 2.0
+                ? "checkmark.circle.fill"
+                : "hand.raised.fill"
+    }
+
+    private var label: String {
+        holdSteady ? "Hold still"
+            : angularRateDps < 2.0
+                ? "X5 ready" : "Hold steady"
+    }
+
+    private var color: Color {
+        holdSteady ? .yellow
+            : angularRateDps < 2.0 ? .green : .orange
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.caption2)
+            Text(label)
+                .font(.caption.weight(.bold))
+        }
+        .foregroundColor(color)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(color.opacity(0.15))
+        .background(.ultraThinMaterial)
+        .cornerRadius(8)
+    }
+}
+
+private struct DepthOverlayUIView: UIViewRepresentable {
+    let image: UIImage
+
+    func makeUIView(context: Context) -> UIImageView {
+        let iv = UIImageView()
+        iv.contentMode = .scaleAspectFill
+        iv.clipsToBounds = true
+        iv.alpha = 0.6
+        return iv
+    }
+
+    func updateUIView(_ uiView: UIImageView, context: Context) {
+        uiView.image = image
+    }
+}

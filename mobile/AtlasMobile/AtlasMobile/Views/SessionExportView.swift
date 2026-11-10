@@ -1,0 +1,555 @@
+import ImageIO
+import simd
+import SwiftUI
+
+/// Presented after endSession() — lets the user choose how to process the session.
+struct SessionExportView: View {
+    let sessionDirectory: URL
+    @StateObject private var postProcessor = PostProcessingManager()
+    @StateObject private var uploader = HostUploader()
+    @AppStorage("hostURL") private var hostURL = "http://192.168.1.100:8765"
+
+    @State private var selectedMode: ExportMode = .colmapOnly
+    @AppStorage("multiCameraExport") private var multiCameraExport = true
+    @State private var isRunning = false
+    @State private var isComplete = false
+    @State private var isZipping = false
+    @State private var shareItem: ShareableURL?
+    @State private var rigCalResult: RigCalibrator.Result?
+    @State private var arkitCheck: ARKitTrackingCheck.Result?
+    /// Rig calibration on the phone before a COLMAP export. Off by
+    /// default: exports ended the app at "Calibrating rig" and the
+    /// cause is not confirmed (see export_trace.log).
+    @AppStorage("onDeviceRigCalibration") private var onDeviceRigCalibration = false
+    /// Last lines of this session's export trace when the app ended
+    /// during its last export; nil otherwise.
+    @State private var lastTrace: [String]?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                // Mode picker
+                Section("Export Mode") {
+                    ForEach(ExportMode.allCases) { mode in
+                        ModeRow(mode: mode, isSelected: selectedMode == mode) {
+                            selectedMode = mode
+                        }
+                    }
+                }
+
+                // Camera model
+                if selectedMode != .hostProcessing {
+                    Section("Camera Model") {
+                        Picker("Export Mode", selection: $multiCameraExport) {
+                            Text("Canonical Tiles").tag(false)
+                            Text("Fisheye").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        Text(multiCameraExport
+                             ? "Insta360 exported as 2 equidistant fisheye lenses "
+                               + "(OPENCV_FISHEYE). Full FOV, requires 3DGUT."
+                             : "Insta360 exported as 8 perspective tiles "
+                               + "(SIMPLE_PINHOLE). Compatible with all pipelines.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+
+                // Host URL (only shown for host mode)
+                if selectedMode == .hostProcessing {
+                    Section("Host") {
+                        HStack {
+                            Text("URL")
+                                .foregroundColor(.secondary)
+                            TextField("http://192.168.1.100:8765", text: $hostURL)
+                                .keyboardType(.URL)
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                        }
+                        Text("Run enhance_server.py on your workstation first.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                // On-device model availability
+                if selectedMode == .fullOnDevice {
+                    Section("Models") {
+                        ModelStatusRow("PromptDA",
+                                       available: postProcessor.promptDAAvailable)
+                        ModelStatusRow("StableNormal",
+                                       available: postProcessor.stableNormalAvailable)
+                        if !postProcessor.promptDAAvailable || !postProcessor.stableNormalAvailable {
+                            Text("Bundle PromptDA.mlpackage and StableNormal.mlpackage " +
+                                 "with the app. Run convert_models.py to generate them.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+                if selectedMode == .colmapOnly {
+                    Section("Rig Calibration on Phone") {
+                        Toggle("Calibrate rig before export",
+                               isOn: $onDeviceRigCalibration)
+                        Text("Experimental. Off: the export uses the rig "
+                             + "extrinsics as they are.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                // Where the previous export was when the app ended
+                if let trace = lastTrace, !isRunning, !isComplete {
+                    Section("Last Export Stopped") {
+                        Text("The app ended during the last export."
+                             + " Its last steps were:")
+                            .font(.caption)
+                        ForEach(Array(trace.enumerated()), id: \.offset) {
+                            _, line in
+                            Text(line)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                        Button("Share log") {
+                            shareItem = ShareableURL(
+                                url: sessionDirectory
+                                    .appendingPathComponent(
+                                        ExportTrace.fileName))
+                        }
+                    }
+                }
+
+                // Rig calibration result
+                if let cal = rigCalResult {
+                    Section("Rig Calibration") {
+                        rigCalSection(cal)
+                    }
+                }
+
+                // ARKit tracking check (also saved as arkit_check.json)
+                if let check = arkitCheck {
+                    Section("ARKit Tracking") {
+                        HStack {
+                            Circle()
+                                .fill(check.hasIssues
+                                      ? Color.orange : Color.green)
+                                .frame(width: 10, height: 10)
+                            Text(check.hasIssues
+                                 ? "Check poses" : "OK")
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        Text(check.summary)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                // Progress
+                if isRunning || isComplete {
+                    Section("Progress") {
+                        progressSection
+                    }
+                }
+
+                // Host log
+                if selectedMode == .hostProcessing && !uploader.logLines.isEmpty {
+                    Section("Host Log") {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(uploader.logLines, id: \.self) { line in
+                                    Text(line)
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 150)
+                    }
+                }
+            }
+            .sheet(item: $shareItem) { item in
+                ShareSheet(url: item.url)
+            }
+            .navigationTitle("Export Session")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Skip") { dismiss() }
+                        .disabled(isRunning)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isRunning ? "Running…" : "Export") {
+                        Task { await runExport() }
+                    }
+                    .disabled(isRunning || isComplete)
+                }
+            }
+            .task { await postProcessor.loadModels() }
+            .onAppear {
+                lastTrace = ExportTrace.unfinished(
+                    sessionDirectory: sessionDirectory)
+            }
+            .onChange(of: multiCameraExport) { _ in
+                isComplete = false
+            }
+        }
+    }
+
+    // MARK: - Rig calibration section
+
+    @ViewBuilder
+    private func rigCalSection(
+        _ cal: RigCalibrator.Result
+    ) -> some View {
+        let color: Color = {
+            switch cal.status {
+            case .applied: return .green
+            case .flagged: return .orange
+            case .skipped: return .secondary
+            }
+        }()
+        HStack {
+            Circle().fill(color).frame(width: 10, height: 10)
+            Text(cal.status.rawValue.capitalized)
+                .font(.subheadline.weight(.semibold))
+        }
+        if cal.facesTotal > 0 {
+            Text(String(format:
+                "Faces: %d / %d used",
+                cal.facesUsed, cal.facesTotal))
+                .font(.system(.caption, design: .monospaced))
+        }
+        if cal.correctionAngleDeg > 0 {
+            Text(String(format:
+                "Correction: %.2f° / %.1f cm",
+                cal.correctionAngleDeg,
+                cal.correctionShiftCm))
+                .font(.system(.caption, design: .monospaced))
+            Text(String(format:
+                "Error: %.2f° → %.2f°",
+                cal.errorBeforeDeg, cal.errorAfterDeg))
+                .font(.system(.caption, design: .monospaced))
+        }
+        Text(cal.reason)
+            .font(.caption2)
+            .foregroundColor(.secondary)
+    }
+
+    // MARK: - Progress section
+
+    @ViewBuilder
+    private var progressSection: some View {
+        let p = currentProgress
+        VStack(alignment: .leading, spacing: 8) {
+            Text(p.stage)
+                .font(.subheadline)
+            ProgressView(value: p.fraction)
+            if let err = p.error {
+                Label(err, systemImage: "exclamationmark.triangle")
+                    .foregroundColor(.red)
+                    .font(.caption)
+            }
+            if p.isComplete {
+                Label("Done", systemImage: "checkmark.circle.fill")
+                    .foregroundColor(.green)
+                Button(isZipping ? "Zipping…" : "Share Session") {
+                    Task { await zipAndShare() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isZipping)
+            }
+        }
+    }
+
+    private var currentProgress: ExportProgress {
+        switch selectedMode {
+        case .colmapOnly:    return postProcessor.progress
+        case .fullOnDevice:  return postProcessor.progress
+        case .hostProcessing: return uploader.progress
+        }
+    }
+
+    // MARK: - Run
+
+    private func zipAndShare() async {
+        isZipping = true
+        let dir = sessionDirectory
+        let url = await Task.detached(priority: .userInitiated) {
+            let zipURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(dir.lastPathComponent).zip")
+            try? FileManager.default.removeItem(at: zipURL)
+            let ok = ZipWriter.write(sourceDir: dir, to: zipURL)
+            print("[Share] zip \(ok ? "OK" : "FAILED")"
+                + " → \(zipURL.lastPathComponent)")
+            if ok, let attrs = try? FileManager.default
+                .attributesOfItem(atPath: zipURL.path),
+                let size = attrs[.size] as? Int
+            {
+                print("[Share] zip size: "
+                    + "\(size / 1_048_576) MB")
+            }
+            return ok ? zipURL : nil
+        }.value
+        guard let url else {
+            print("[Share] zip returned nil")
+            isZipping = false
+            return
+        }
+        isZipping = false
+        shareItem = ShareableURL(url: url)
+        print("[Share] presenting sheet")
+    }
+
+    private func runCOLMAPExport() async {
+        let dir = sessionDirectory
+        let useMulti = UserDefaults.standard.bool(
+            forKey: "multiCameraExport"
+        )
+        let calibrateRig = UserDefaults.standard.bool(
+            forKey: "onDeviceRigCalibration"
+        )
+        postProcessor.progress = ExportProgress(
+            stage: calibrateRig
+                ? "Calibrating rig…" : "Checking ARKit tracking…",
+            current: 0, total: 1
+        )
+        let modeStr = useMulti
+            ? "nativeFisheye" : "pinholeTiles"
+        print("[Export] mode: \(modeStr)")
+        ExportTrace.begin(
+            sessionDirectory: dir,
+            "export started: \(modeStr), rig calibration "
+                + (calibrateRig ? "on" : "off"))
+        do {
+            // Phase 1: rig calibration
+            let (cal, check) = await Task.detached(
+                priority: .userInitiated
+            ) { () async -> (RigCalibrator.Result,
+                             ARKitTrackingCheck.Result) in
+                let fm = FileManager.default
+                let rec = DataRecorder(
+                    sessionDirectory: dir)
+                let one = COLMAPExporter.singleInsta360Camera(
+                    scans: rec.buildExportData(
+                        sessionDirectory: dir),
+                    config: MultiCameraConfig
+                        .loadFromDeviceOrBundle())
+                let scans = one.scans
+                let cfg = one.config
+                let traj = COLMAPExporter
+                    .loadTrajectory(
+                        sessionDirectory: dir)
+                let withX5 = scans.filter {
+                    !$0.insta360ImageURLs.isEmpty
+                }.count
+                ExportTrace.note(
+                    "loaded \(scans.count) scans (\(withX5) with"
+                        + " a 360 image), trajectory"
+                        + " \(traj?.count ?? 0) poses")
+                ExportTrace.note(one.note)
+                let docs = fm.urls(
+                    for: .documentDirectory,
+                    in: .userDomainMask).first
+                let mDir = docs?
+                    .appendingPathComponent(
+                        "atlas_sessions/masks")
+
+                let arkit = ARKitTrackingCheck.run(
+                    sessionDirectory: dir, trajectory: traj)
+                ARKitTrackingCheck.save(arkit, in: dir)
+                print("[Export] ARKit check: \(arkit.summary)")
+                ExportTrace.note("ARKit check: \(arkit.summary)")
+
+                let result = calibrateRig
+                    ? RigCalibrator.calibrate(
+                        scans: scans,
+                        cameraConfig: cfg,
+                        trajectory: traj,
+                        maskDir: mDir)
+                    : RigCalibrator.skip(
+                        "turned off in export settings")
+                print("[Export] calibration done: "
+                    + "\(result.status.rawValue)")
+                ExportTrace.note("rig calibration done: "
+                    + "\(result.status.rawValue)")
+                return (result, arkit)
+            }.value
+
+            rigCalResult = cal
+            arkitCheck = check
+            if cal.status == .applied {
+                COLMAPExporter.setRigCorrection(
+                    cal.rigCorrectionForExport)
+            } else {
+                COLMAPExporter.resetRigCorrection()
+            }
+
+            // Phase 2: COLMAP export
+            postProcessor.progress = ExportProgress(
+                stage: "Building COLMAP model…",
+                current: 0, total: 1)
+            ExportTrace.note("building COLMAP model")
+            let pp = postProcessor
+
+            try await Task.detached(
+                priority: .userInitiated
+            ) {
+                let fm = FileManager.default
+                let colmapDir = dir
+                    .appendingPathComponent("colmap")
+                if fm.fileExists(
+                    atPath: colmapDir.path)
+                {
+                    try? fm.removeItem(at: colmapDir)
+                }
+
+                let rec = DataRecorder(
+                    sessionDirectory: dir)
+                // The same single camera the rig calibration used.
+                let one = COLMAPExporter.singleInsta360Camera(
+                    scans: rec.buildExportData(
+                        sessionDirectory: dir),
+                    config: MultiCameraConfig
+                        .loadFromDeviceOrBundle())
+                let scans = one.scans
+                guard !scans.isEmpty else {
+                    throw NSError(
+                        domain: "Export",
+                        code: 1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "No scans with valid"
+                                + " pose data found."
+                        ])
+                }
+                let cfg = one.config
+                let mode: CameraExportMode = useMulti
+                    ? .nativeFisheye
+                    : .pinholeTiles
+                let exporter = COLMAPExporter(
+                    sessionDirectory: dir)
+                try exporter.export(
+                    scans: scans,
+                    cameraConfig: cfg,
+                    cameraExportMode: mode,
+                    onStage: { stage in
+                        // Show the current step, so the screen says
+                        // where the export was if it stops. The trace
+                        // keeps it after the app has ended.
+                        ExportTrace.note(stage)
+                        Task { @MainActor in
+                            guard !pp.progress.isComplete,
+                                  pp.progress.error == nil
+                            else { return }
+                            pp.progress.stage =
+                                "Building COLMAP model: \(stage)"
+                        }
+                    })
+            }.value
+
+            COLMAPExporter.resetRigCorrection()
+            ExportTrace.finish("COLMAP model ready")
+            postProcessor.progress = ExportProgress(
+                stage: "COLMAP model ready",
+                current: 1, total: 1,
+                isComplete: true
+            )
+        } catch {
+            ExportTrace.finish(
+                "failed: \(error.localizedDescription)")
+            postProcessor.progress = ExportProgress(
+                stage: "COLMAP export failed",
+                error: error.localizedDescription
+            )
+        }
+    }
+
+    private func runExport() async {
+        isRunning = true
+        lastTrace = nil
+
+        switch selectedMode {
+        case .colmapOnly:
+            await runCOLMAPExport()
+
+        case .fullOnDevice:
+            await postProcessor.runFullPipeline(sessionDirectory: sessionDirectory)
+
+        case .hostProcessing:
+            await uploader.upload(sessionDirectory: sessionDirectory, hostURL: hostURL)
+        }
+
+        isRunning = false
+        isComplete = true
+    }
+
+}
+
+// MARK: - Sub-views
+
+private struct ModeRow: View {
+    let mode: ExportMode
+    let isSelected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: mode.systemImage)
+                    .frame(width: 28)
+                    .foregroundColor(isSelected ? .accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(mode.rawValue)
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    Text(mode.description)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .foregroundColor(.accentColor)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ModelStatusRow: View {
+    let name: String
+    let available: Bool
+    init(_ name: String, available: Bool) {
+        self.name = name
+        self.available = available
+    }
+    var body: some View {
+        HStack {
+            Text(name)
+            Spacer()
+            Label(available ? "Ready" : "Not bundled",
+                  systemImage: available ? "checkmark.circle.fill" : "xmark.circle")
+                .foregroundColor(available ? .green : .orange)
+                .font(.caption)
+        }
+    }
+}
+
+private struct ShareableURL: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct ShareSheet: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+}

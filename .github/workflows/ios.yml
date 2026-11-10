@@ -1,0 +1,66 @@
+name: Build iOS (unsigned)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: xcodebuild -version && xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Get Insta360 frameworks (private release asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download sdk --repo "$GITHUB_REPOSITORY" --pattern 'iOS-SDK-V1.11.3.zip' --dir /tmp
+          # Extract only the four frameworks the app uses.
+          unzip -q /tmp/iOS-SDK-V1.11.3.zip 'iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks/*' -d /tmp/sdk
+          FW=/tmp/sdk/iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks
+          mkdir -p mobile/AtlasMobile/Frameworks
+          for f in INSCameraSDK INSCameraServiceSDK INSCoreMedia SSZipArchive; do
+            cp -R "$FW/$f.xcframework" mobile/AtlasMobile/Frameworks/
+          done
+          rm -rf /tmp/sdk /tmp/iOS-SDK-V1.11.3.zip
+          ls mobile/AtlasMobile/Frameworks
+
+      - name: Install XcodeGen where setup_ios.sh expects it
+        run: |
+          # The release zip contains xcodegen/, so unzipping into ~ gives
+          # ~/xcodegen/bin/xcodegen (setup_ios.sh skips its own install).
+          curl -fsSL -o /tmp/xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+          unzip -oq /tmp/xcodegen.zip -d ~/
+          ~/xcodegen/bin/xcodegen --version
+
+      - name: Fetch OpenCV and generate project
+        working-directory: mobile/AtlasMobile
+        run: bash setup_ios.sh
+
+      - name: Build
+        working-directory: mobile/AtlasMobile
+        run: |
+          xcodebuild -project AtlasMobile.xcodeproj -scheme AtlasMobile \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -configuration Release -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            | tail -40
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Package IPA
+        working-directory: mobile/AtlasMobile
+        run: |
+          rm -rf Payload && mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/AtlasMobile.app Payload/
+          zip -qry AtlasMobile-unsigned.ipa Payload
+          unzip -tq AtlasMobile-unsigned.ipa
+          ls -la AtlasMobile-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AtlasMobile-unsigned
+          path: mobile/AtlasMobile/AtlasMobile-unsigned.ipa
+          retention-days: 14
