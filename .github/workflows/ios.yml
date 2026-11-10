@@ -17,7 +17,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download sdk --repo "$GITHUB_REPOSITORY" --pattern 'iOS-SDK-V1.11.3.zip' --dir /tmp
+          gh release download x --repo "$GITHUB_REPOSITORY" --pattern 'iOS-SDK-V1.11.3.zip' --dir /tmp
           # Extract only the four frameworks the app uses.
           unzip -q /tmp/iOS-SDK-V1.11.3.zip 'iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks/*' -d /tmp/sdk
           FW=/tmp/sdk/iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks
