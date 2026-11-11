@@ -1,0 +1,45 @@
+name: Build Insta360 sample app (unsigned)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Get Insta360 SDK zip (private release asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download x --repo "$GITHUB_REPOSITORY" --pattern 'iOS-SDK-V1.11.3.zip' --dir /tmp
+          unzip -q /tmp/iOS-SDK-V1.11.3.zip -d ~/sdk
+          rm /tmp/iOS-SDK-V1.11.3.zip
+
+      - name: Build
+        working-directory: /Users/runner/sdk/iOS_v1.11.3/INSCameraSDKSample-bluetooth
+        run: |
+          xcodebuild -version
+          # Sample targets iOS 12; current Xcode only accepts 15+.
+          xcodebuild -project INSCameraSDKSample-bluetooth.xcodeproj \
+            -scheme INSCameraSDKSample-bluetooth -sdk iphoneos \
+            -destination 'generic/platform=iOS' -configuration Release \
+            -derivedDataPath build IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            | tail -40
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Package IPA
+        working-directory: /Users/runner/sdk/iOS_v1.11.3/INSCameraSDKSample-bluetooth
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          mkdir Payload && cp -R "$APP" Payload/
+          zip -qry "$GITHUB_WORKSPACE/Insta360Sample-unsigned.ipa" Payload
+          unzip -tq "$GITHUB_WORKSPACE/Insta360Sample-unsigned.ipa"
+          ls -la "$GITHUB_WORKSPACE/Insta360Sample-unsigned.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Insta360Sample-unsigned
+          path: Insta360Sample-unsigned.ipa
+          retention-days: 14
