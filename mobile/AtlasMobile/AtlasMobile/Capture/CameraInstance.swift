@@ -56,21 +56,6 @@ final class CameraInstance: NSObject, Identifiable {
     private var _photoWaiter: ((String, Double) -> Bool)?
     /// When the in-flight takePicture's completion arrived without a URI.
     private var _captureReplyTs: Double?
-    private(set) var isPhotoModeSet = false
-    /// setAppid and PureShot sent on this connection
-    /// (setAppIdAndPureShot).
-    private(set) var isPureShotSet = false
-
-    /// UserDefaults key of Camera Settings → "Match SDK sample exactly".
-    static let matchSDKSampleKey = "insta360MatchSDKSample"
-
-    /// When on, a shot uses only the steps of the SDK sample's
-    /// "X5 Take Picture": no photo mode or sensor change, no FlowState
-    /// or horizon setting, no 120 s exposure for the timeout, and no
-    /// warmup photo. Read at each connection.
-    static var matchSDKSample: Bool {
-        UserDefaults.standard.bool(forKey: matchSDKSampleKey)
-    }
 
     /// Shots captured but not yet downloaded.
     var pendingDownloadCount: Int {
@@ -95,6 +80,7 @@ final class CameraInstance: NSObject, Identifiable {
     private var kvoToken: NSKeyValueObservation?
     private var disconnectToken: NSKeyValueObservation?
     private var photoPushObserver: NSObjectProtocol?
+    private var takePictureStateObserver: NSObjectProtocol?
 
     init(config: CameraConfig) {
         self.id = config.id
@@ -255,8 +241,8 @@ final class CameraInstance: NSObject, Identifiable {
         onStatusUpdate = statusUpdate
         onDisconnect = disconnectHandler
         for attempt in 1...maxRetries {
+            // Insta360CaptureManager starts the live preview afterwards.
             if await connect() {
-                await configureForCapture()
                 return true
             }
             if attempt < maxRetries {
@@ -425,12 +411,21 @@ final class CameraInstance: NSObject, Identifiable {
 
     // MARK: - Capture
 
+    // A shot follows the SDK sample's take-picture page
+    // (CameraConfigByJsonController.swift, opened with "Record new"):
+    // its live preview runs, and "X5 Take Picture" sends setAppid, then
+    // PureShot, then takePicture. The sample sets no photo mode, sensor,
+    // FlowState or horizon option and takes no warmup photo, so this
+    // doesn't either.
+
+    /// Everything a shot does before takePicture. Calibration calls this
+    /// first and then fires with skipPreChecks, so takePicture follows
+    /// the ARKit frame closely.
     func prepareForCapture() async -> Bool {
         guard await ensureSDKConnected() else {
             return false
         }
-        _ = await warmUpCommandChannel()
-        await ensurePhotoMode()
+        await prepareShot()
         return true
     }
 
@@ -438,8 +433,7 @@ final class CameraInstance: NSObject, Identifiable {
         arkitTimestamp: Double,
         scanIndex: Int,
         timeout: Double = 45,
-        skipPreChecks: Bool = false,
-        retryOnFailure: Bool = true
+        skipPreChecks: Bool = false
     ) async -> Insta360CaptureResult? {
         guard !Task.isCancelled else { return nil }
 
@@ -463,38 +457,15 @@ final class CameraInstance: NSObject, Identifiable {
             guard await ensureSDKConnected() else {
                 return nil
             }
+            await prepareShot()
         }
 
-        if !skipPreChecks {
-            _ = await warmUpCommandChannel()
-            await ensurePhotoMode()
-        }
-
+        // One takePicture per shot, as the sample sends one per press.
+        // The old retry after a missed reply took a second photo.
         let commandTs = ProcessInfo.processInfo.systemUptime
-        var captureResult: (
-            uri: String, callbackTimestamp: Double
-        )?
-        captureResult = await attemptTakePicture(
+        let captureResult = await attemptTakePicture(
             timeout: timeout
         )
-
-        if captureResult == nil, retryOnFailure {
-            onStatusUpdate?(
-                "[\(id)] attempt 1 failed"
-                + " — waiting 15s for camera"
-            )
-            try? await Task.sleep(
-                for: .seconds(15)
-            )
-            let recovered = await waitForCommandReady(
-                maxWait: 75
-            )
-            if recovered, !Task.isCancelled {
-                captureResult = await attemptTakePicture(
-                    timeout: timeout
-                )
-            }
-        }
 
         if let uri = captureResult?.uri {
             lock.lock()
@@ -553,51 +524,26 @@ final class CameraInstance: NSObject, Identifiable {
         return await waitForConnected(maxWait: 10)
     }
 
-    private func waitForCameraReady(
-        maxWait: Double = 10
-    ) async -> Bool {
-        let start = Date()
-        while Date().timeIntervalSince(start) < maxWait {
-            guard !Task.isCancelled else { return false }
-            let ready = await withCheckedContinuation {
-                (cont: CheckedContinuation<Bool, Never>) in
-                DispatchQueue.main.async {
-                    INSCameraManager.shared()
-                        .commandManager
-                        .getCurrentCaptureStatus {
-                            error, status in
-                            if let error {
-                                self.onStatusUpdate?(
-                                    "[\(self.id)] status"
-                                    + " err: \(error)"
-                                )
-                                cont.resume(returning: false)
-                                return
-                            }
-                            let state = status?.state
-                                ?? .notCapture
-                            if state == .notCapture {
-                                cont.resume(returning: true)
-                            } else {
-                                self.onStatusUpdate?(
-                                    "[\(self.id)] camera"
-                                    + " state="
-                                    + "\(state.rawValue)"
-                                    + " — waiting"
-                                )
-                                cont.resume(returning: false)
-                            }
-                        }
-                }
-            }
-            if ready { return true }
-            try? await Task.sleep(for: .seconds(1))
+    /// Brings the camera to where the sample's page is when its button
+    /// sends takePicture: the live preview runs, and setAppid and PureShot
+    /// have just been sent.
+    private func prepareShot() async {
+        let previewRunning = await Insta360LivePreview.shared
+            .waitUntilRunning(timeout: 10)
+        if !previewRunning {
+            onStatusUpdate?(
+                "[\(id)] live preview not running"
+                + " — taking the photo anyway"
+            )
         }
-        onStatusUpdate?(
-            "[\(id)] camera not ready after"
-            + " \(Int(maxWait))s"
-        )
-        return false
+        let pureShotSet = await setAppIdAndPureShot()
+        if !pureShotSet {
+            // The sample's plain "Take Picture" button sends takePicture
+            // without them.
+            onStatusUpdate?(
+                "[\(id)] taking the photo without setAppid/PureShot"
+            )
+        }
     }
 
     func waitForCommandReady(
@@ -653,13 +599,13 @@ final class CameraInstance: NSObject, Identifiable {
                         if let error {
                             self?.onStatusUpdate?(
                                 "[\(self?.id ?? "?")]"
-                                + " warmup: "
+                                + " command check: "
                                 + "\(error)"
                             )
                         } else {
                             self?.onStatusUpdate?(
                                 "[\(self?.id ?? "?")]"
-                                + " warmup OK"
+                                + " command check OK"
                             )
                         }
                         finish(error == nil)
@@ -675,7 +621,7 @@ final class CameraInstance: NSObject, Identifiable {
                 if !alreadyDone {
                     self?.onStatusUpdate?(
                         "[\(self?.id ?? "?")]"
-                        + " warmup timeout"
+                        + " command check timeout"
                         + " (\(Int(timeout))s)"
                     )
                 }
@@ -684,471 +630,14 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    private var _stopCont: CheckedContinuation<
-        Void, Never
-    >?
-
-    private func stopCurrentCapture() async {
-        await withCheckedContinuation {
-            (continuation: CheckedContinuation<Void, Never>)
-                in
-            self.lock.lock()
-            self._stopCont = continuation
-            self.lock.unlock()
-
-            func finish() {
-                self.lock.lock()
-                let cont = self._stopCont
-                self._stopCont = nil
-                self.lock.unlock()
-                cont?.resume()
-            }
-
-            DispatchQueue.main.async {
-                INSCameraManager.shared()
-                    .commandManager
-                    .stopTakePicture { [weak self] error in
-                        if let error {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "stopCapture: \(error)"
-                            )
-                        }
-                        finish()
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 3
-            ) {
-                finish()
-            }
-        }
-    }
-
-    /// Takes a photo that is never downloaded, so the first real shot
-    /// isn't the camera's first after connecting. It waits for the photo
-    /// URI like a real shot: on X6 firmware that sends the URI in a
-    /// push, the warmup photo's push is used up here instead of being
-    /// given to the first real shot.
-    func warmupCapture(
-        timeout: Double = 30
-    ) async -> Bool {
-        _ = await warmUpCommandChannel(timeout: 8)
-        await ensurePhotoMode()
-        lock.lock()
-        let alreadyBusy = _captureInFlight
-        if !alreadyBusy { _captureInFlight = true }
-        lock.unlock()
-        if alreadyBusy {
-            onStatusUpdate?(
-                "[\(id)] warmupCapture skipped — in-flight"
-            )
-            return false
-        }
-        defer {
-            lock.lock()
-            _captureInFlight = false
-            lock.unlock()
-        }
-        onStatusUpdate?(
-            "[\(id)] priming pipeline…"
-        )
-        let ack = await attemptTakePicture(
-            timeout: timeout,
-            label: "warmupCapture"
-        )
-        onStatusUpdate?(
-            "[\(id)] warmupCapture "
-            + (ack == nil ? "failed" : "OK")
-        )
-        return ack != nil
-    }
-
-    private func checkSensorIsAll() async -> Bool {
-        await withCheckedContinuation {
-            (cont: CheckedContinuation<Bool, Never>) in
-            let done = NSLock()
-            var didResume = false
-
-            func finish(_ result: Bool) {
-                done.lock()
-                defer { done.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                cont.resume(returning: result)
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                INSCameraManager.shared()
-                    .commandManager
-                    .getActiveSensor {
-                        error, device, _, _, _ in
-                        if let error {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "getActiveSensor: "
-                                + "\(error)"
-                            )
-                            finish(false)
-                            return
-                        }
-                        let isAll = device == .all
-                        self?.onStatusUpdate?(
-                            "[\(self?.id ?? "?")] "
-                            + "sensor="
-                            + "\(device.rawValue)"
-                            + (isAll
-                                ? " (all)"
-                                : " (not all)")
-                        )
-                        finish(isAll)
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 10
-            ) { [weak self] in
-                done.lock()
-                let alreadyDone = didResume
-                done.unlock()
-                if !alreadyDone {
-                    self?.onStatusUpdate?(
-                        "[\(self?.id ?? "?")] "
-                        + "getActiveSensor timeout"
-                    )
-                }
-                finish(false)
-            }
-        }
-    }
-
-    /// The X6 (SDK name C9) keeps its sensor in low power after a Wi-Fi
-    /// connection until the app reports live view. The SDK sample sends
-    /// setAppAccessFileState(.liveView) on connect, for C9 only.
-    private func wakeX6IfNeeded() async {
-        let isX6 = await MainActor.run {
-            INSCameraManager.socket().currentCamera?.name
-                == kInsta360CameraNameC9
-        }
-        guard isX6 else { return }
-        await withCheckedContinuation {
-            (continuation: CheckedContinuation<Void, Never>)
-                in
-            let resumed = NSLock()
-            var didResume = false
-
-            func finish() {
-                resumed.lock()
-                defer { resumed.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume()
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                INSCameraManager.shared()
-                    .commandManager
-                    .setAppAccessFileState(.liveView) {
-                        [weak self] error in
-                        self?.onStatusUpdate?(
-                            "[\(self?.id ?? "?")] "
-                            + "X6 live view: "
-                            + (error.map { "\($0)" } ?? "ok")
-                        )
-                        finish()
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 5
-            ) {
-                finish()
-            }
-        }
-    }
-
-    func switchToPhotoMode() async {
-        await wakeX6IfNeeded()
-        let skipActivation = await checkSensorIsAll()
-
-        await withCheckedContinuation {
-            (continuation: CheckedContinuation<Void, Never>)
-                in
-            let resumed = NSLock()
-            var didResume = false
-
-            func finish() {
-                resumed.lock()
-                defer { resumed.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume()
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                let opts = INSCameraOptions()
-                // A normal 360 photo is photo sub mode 0
-                // (INSPhotoSubModeSingle), as the desktop capture sets
-                // (PHOTO_SINGLE). The 6 used before is the function mode
-                // of a normal photo in the SDK sample's mode table; as a
-                // photo sub mode it means InstaPano HDR, a mode the X6
-                // doesn't have.
-                opts.photoSubMode = 0
-                opts.focusSensor = .all
-                opts.expectOutputType = .default
-                let types: [NSNumber] = [
-                    NSNumber(
-                        value: INSCameraOptionsType
-                            .photoSubMode.rawValue
-                    ),
-                    NSNumber(
-                        value: INSCameraOptionsType
-                            .focusSensor.rawValue
-                    ),
-                    NSNumber(
-                        value: INSCameraOptionsType
-                            .expectOutputType.rawValue
-                    ),
-                ]
-                INSCameraManager.shared()
-                    .commandManager
-                    .setOptions(
-                        opts,
-                        forTypes: types
-                    ) { [weak self] error, successTypes in
-                        // A partial failure (INSCameraErrorCodeAccept,
-                        // 202) still counts when the photo sub mode was
-                        // applied. Otherwise ensurePhotoMode redoes this
-                        // whole setup before every shot.
-                        let modeApplied = error == nil
-                            || (successTypes ?? []).contains {
-                                $0.uint16Value
-                                    == INSCameraOptionsType
-                                        .photoSubMode.rawValue
-                            }
-                        if let error {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "setPhotoMode err: "
-                                + "\(error)"
-                                + (modeApplied
-                                    ? " (photo sub mode applied)"
-                                    : "")
-                            )
-                        }
-                        guard modeApplied else {
-                            finish()
-                            return
-                        }
-                        self?.isPhotoModeSet = true
-                        self?.onStatusUpdate?(
-                            "[\(self?.id ?? "?")] "
-                            + "photo mode set"
-                        )
-
-                        if skipActivation {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "sensor already .all"
-                                + " — skip activation"
-                            )
-                            finish()
-                            return
-                        }
-
-                        self?.onStatusUpdate?(
-                            "[\(self?.id ?? "?")] "
-                            + "activating sensors…"
-                        )
-                        INSCameraManager.shared()
-                            .commandManager
-                            .setActiveSensorWith(
-                                .all
-                            ) { [weak self] error,
-                                _, _, _ in
-                                if let error {
-                                    self?.onStatusUpdate?(
-                                        "[\(self?.id ?? "?")] "
-                                        + "activeSensor err: "
-                                        + "\(error)"
-                                    )
-                                } else {
-                                    self?.onStatusUpdate?(
-                                        "[\(self?.id ?? "?")] "
-                                        + "sensor activated"
-                                    )
-                                }
-                                finish()
-                            }
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 90
-            ) { [weak self] in
-                resumed.lock()
-                let alreadyDone = didResume
-                resumed.unlock()
-                if !alreadyDone {
-                    self?.onStatusUpdate?(
-                        "[\(self?.id ?? "?")] "
-                        + "switchToPhotoMode timeout"
-                    )
-                }
-                finish()
-            }
-        }
-    }
-
-    func disableStabilization() async {
-        await withCheckedContinuation {
-            (continuation: CheckedContinuation<Void, Never>)
-                in
-            let resumed = NSLock()
-            var didResume = false
-
-            func finish() {
-                resumed.lock()
-                defer { resumed.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume()
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                let opts = INSCameraOptions()
-                opts.enableInternalFlowstate = false
-                var types: [NSNumber] = [
-                    NSNumber(
-                        value: INSCameraOptionsType
-                            .internalFlowstate.rawValue
-                    ),
-                ]
-                opts.horizonIndicatorEnable = false
-                types.append(
-                    NSNumber(
-                        value: INSCameraOptionsType
-                            .horizontalEnableGlobal
-                            .rawValue
-                    )
-                )
-                INSCameraManager.shared()
-                    .commandManager
-                    .setOptions(
-                        opts,
-                        forTypes: types
-                    ) { [weak self] error, _ in
-                        if let error {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "disableStab err: "
-                                + "\(error)"
-                            )
-                        } else {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "stabilization disabled"
-                            )
-                        }
-                        finish()
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 5
-            ) {
-                finish()
-            }
-        }
-    }
-
-    /// Prepares the camera for shots after connecting. Logs the photo
-    /// sub mode the camera is in. Then, unless "Match SDK sample
-    /// exactly" is on, applies the app's own settings (single photo,
-    /// both sensors, FlowState and horizon leveling off). Last, sends
-    /// the setAppid and PureShot commands of the SDK sample's
-    /// "X5 Take Picture".
-    func configureForCapture() async {
-        await logPhotoSubMode()
-        if !Self.matchSDKSample {
-            await switchToPhotoMode()
-            await disableStabilization()
-        }
-        await setAppIdAndPureShot()
-    }
-
-    /// Redoes the parts of configureForCapture that failed.
-    func ensurePhotoMode() async {
-        let needsMode = !Self.matchSDKSample && !isPhotoModeSet
-        guard needsMode || !isPureShotSet else { return }
-        let ready = await warmUpCommandChannel()
-        guard ready else { return }
-        if needsMode {
-            await switchToPhotoMode()
-            await disableStabilization()
-        }
-        await setAppIdAndPureShot()
-    }
-
-    /// Logs the camera's photo sub mode before the app changes it
-    /// (INSPhotoSubMode: 0 single, 1 HDR).
-    private func logPhotoSubMode() async {
-        await withCheckedContinuation {
-            (continuation: CheckedContinuation<Void, Never>)
-                in
-            let resumed = NSLock()
-            var didResume = false
-
-            func finish() {
-                resumed.lock()
-                defer { resumed.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume()
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                let types: [NSNumber] = [
-                    NSNumber(
-                        value: INSCameraOptionsType
-                            .photoSubMode.rawValue
-                    ),
-                ]
-                INSCameraManager.shared()
-                    .commandManager
-                    .getOptionsWithTypes(
-                        types
-                    ) { [weak self] error, options, _ in
-                        if let options, error == nil {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "camera photo sub mode: "
-                                + "\(options.photoSubMode)"
-                            )
-                        }
-                        finish()
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 5
-            ) {
-                finish()
-            }
-        }
-    }
-
-    /// Sends what the SDK sample's "X5 Take Picture" sends before a
-    /// shot (CameraConfigByJsonController.swift): setAppid, then raw
-    /// capture type PureShot (3) for function mode 8 (HDR_IMAGE),
+    /// Sends what the SDK sample's "X5 Take Picture" sends before every
+    /// takePicture (CameraConfigByJsonController.swift): setAppid, then
+    /// raw capture type PureShot (3) for function mode 8 (HDR_IMAGE),
     /// option type 25. The sample's comment: the camera accepts photo
     /// settings only after setAppid, and without it the photo still
-    /// includes a DNG. The sample sends both before every shot. This
-    /// sends them once per connection, and again before a shot only if
-    /// they failed, so they don't delay each shot.
-    private func setAppIdAndPureShot() async {
-        let ok = await withCheckedContinuation {
+    /// includes a DNG. Returns whether both succeeded.
+    private func setAppIdAndPureShot() async -> Bool {
+        await withCheckedContinuation {
             (continuation: CheckedContinuation<Bool, Never>)
                 in
             let resumed = NSLock()
@@ -1221,32 +710,19 @@ final class CameraInstance: NSObject, Identifiable {
                 finish(false)
             }
         }
-        isPureShotSet = ok
     }
 
     private typealias CaptureAck = (
         uri: String, callbackTimestamp: Double
     )
 
-    /// takePicture options. rawCaptureType and countDown are what the
-    /// SDK sample's "X5 Take Picture" sets. currenExposureOptions only
-    /// feeds the SDK's timeout for the command (INSTakePictureOptions.h);
-    /// 120 s keeps a slow 120 MP X6 reply from timing out inside the
-    /// SDK. The sample doesn't set it, so "Match SDK sample exactly"
-    /// leaves it out.
+    /// The options the sample's "X5 Take Picture" sets: raw capture type
+    /// PureShot and countDown 0. Like the sample, it leaves mode at its
+    /// default (normal) and currenExposureOptions unset.
     private static func takePictureOptions() -> INSTakePictureOptions {
         let opts = INSTakePictureOptions()
-        opts.mode = .normal
         opts.rawCaptureType = .pureshot
         opts.countDown = 0
-        if !matchSDKSample {
-            let exp = INSCameraExposureOptions()
-            exp.program = 3
-            exp.shutterSpeed = CMTime(
-                value: 120, timescale: 1
-            )
-            opts.currenExposureOptions = exp
-        }
         return opts
     }
 
@@ -1255,8 +731,7 @@ final class CameraInstance: NSObject, Identifiable {
     /// firmware returns it in an INSCameraTakePictureResponse push
     /// instead (handlePhotoPush). The SDK sample handles both.
     private func attemptTakePicture(
-        timeout: Double,
-        label: String = "cb"
+        timeout: Double
     ) async -> CaptureAck? {
         return await withTaskCancellationHandler {
             await withCheckedContinuation {
@@ -1313,7 +788,7 @@ final class CameraInstance: NSObject, Identifiable {
                             let hdr = photoInfo?.hdrUris?.count ?? 0
                             let burst = photoInfo?.burstUris?.count
                                 ?? 0
-                            var note = "[\(self.id)] \(label):"
+                            var note = "[\(self.id)] cb:"
                                 + " gen=\(gen)"
                                 + " uri=\(uri ?? "nil")"
                             if hdr > 0 { note += " hdr=\(hdr)" }
@@ -1385,21 +860,42 @@ final class CameraInstance: NSObject, Identifiable {
     // MARK: - Photo URI push
 
     /// Observes on NotificationCenter.default, as the SDK sample does.
+    /// Also logs INSCameraTakePictureStateUpdate, which the sample's root
+    /// page observes, to show how far a shot got if no URI arrives.
     private func startPhotoPushObserver() {
-        guard photoPushObserver == nil else { return }
-        photoPushObserver = NotificationCenter.default.addObserver(
-            forName: .INSCameraTakePictureResponse,
-            object: nil,
-            queue: nil
-        ) { [weak self] note in
-            self?.handlePhotoPush(note)
+        if photoPushObserver == nil {
+            photoPushObserver = NotificationCenter.default.addObserver(
+                forName: .INSCameraTakePictureResponse,
+                object: nil,
+                queue: nil
+            ) { [weak self] note in
+                self?.handlePhotoPush(note)
+            }
+        }
+        if takePictureStateObserver == nil {
+            takePictureStateObserver = NotificationCenter.default
+                .addObserver(
+                    forName: .INSCameraTakePictureStateUpdate,
+                    object: nil,
+                    queue: nil
+                ) { [weak self] note in
+                    let state = note.userInfo?["state"]
+                        .map { "\($0)" } ?? "?"
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")] take picture state: \(state)"
+                    )
+                }
         }
     }
 
     private func stopPhotoPushObserver() {
-        guard let token = photoPushObserver else { return }
-        NotificationCenter.default.removeObserver(token)
+        for token in [photoPushObserver, takePictureStateObserver] {
+            if let token {
+                NotificationCenter.default.removeObserver(token)
+            }
+        }
         photoPushObserver = nil
+        takePictureStateObserver = nil
     }
 
     /// userInfo["photo"] is an INSCameraPhotoInfo. The push goes to the
@@ -1503,23 +999,16 @@ final class CameraInstance: NSObject, Identifiable {
         let clockCont = _clockCont
         let captureCont = _captureCont
         let downloadCont = _downloadCont
-        let stopCont = _stopCont
         _connectCont = nil
         _clockCont = nil
         _captureCont = nil
         _downloadCont = nil
-        _stopCont = nil
         lock.unlock()
 
         connectCont?.resume(returning: false)
         clockCont?.resume(returning: fallback)
         captureCont?.resume(returning: nil)
         downloadCont?.resume(returning: nil)
-        stopCont?.resume()
-
-        // A new connection needs setAppid again.
-        isPhotoModeSet = false
-        isPureShotSet = false
     }
 
     private func downloadOne(

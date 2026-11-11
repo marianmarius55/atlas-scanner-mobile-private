@@ -69,6 +69,10 @@ final class Insta360CaptureManager: ObservableObject {
                 [weak self] msg in
                 self?.onLogMessage?(msg)
             }
+            Insta360LivePreview.shared.onLogMessage = {
+                [weak self] msg in
+                self?.onLogMessage?(msg)
+            }
             let socket = INSCameraManager.socket()
             for cam in connectedCameras {
                 cam.onDisconnect = nil
@@ -136,6 +140,8 @@ final class Insta360CaptureManager: ObservableObject {
         }
         await MainActor.run { connectedCameras = connected }
 
+        // The camera may still be booting: wait until a getOptions read
+        // works, as the sample's page reads options before anything else.
         var commandsReady = false
         if let first = connected.first {
             commandsReady = await first.waitForCommandReady(
@@ -147,19 +153,9 @@ final class Insta360CaptureManager: ObservableObject {
             )
         }
 
-        if commandsReady {
-            await withTaskGroup(of: Void.self) { group in
-                for cam in connected {
-                    group.addTask {
-                        await cam.configureForCapture()
-                    }
-                }
-            }
-            onLogMessage?(
-                "camera configured"
-            )
-        }
-
+        // Then start the live preview, as the sample's take-picture page
+        // does when it opens. The sample changes no other camera setting
+        // and takes no warmup photo. Shots wait for this task.
         warmupTask = Task { [weak self] in
             guard let first = connected.first
             else { return }
@@ -176,52 +172,22 @@ final class Insta360CaptureManager: ObservableObject {
                     )
                     return
                 }
-                for cam in connected {
-                    await cam.configureForCapture()
-                }
-                self?.onLogMessage?(
-                    "camera configured (deferred)"
-                )
             }
-
-            if CameraInstance.matchSDKSample {
-                // The SDK sample takes no warmup photo.
-                await MainActor.run {
-                    self?.isPipelineReady = true
-                }
-                self?.onLogMessage?(
-                    "ready (Match SDK sample: no warmup photo)"
-                )
-                return
-            }
-
-            // No stopTakePicture before the warmup: the SDK sample never
-            // calls it.
-            var primed = await first.warmupCapture()
-            if !primed {
-                self?.onLogMessage?(
-                    "warmup busy — retry in 3s…"
-                )
-                try? await Task.sleep(
-                    for: .seconds(3)
-                )
-                primed = await first.warmupCapture()
-            }
-            await MainActor.run {
-                self?.isPipelineReady = true
-            }
-            self?.onLogMessage?(
-                primed
-                    ? "pipeline primed — ready"
-                    : "pipeline prime failed"
-                    + " — proceeding"
-            )
-
-            self?.onLogMessage?(
-                "ready"
-            )
+            guard !Task.isCancelled else { return }
+            await self?.startLivePreview()
         }
+    }
 
+    /// Starts the live preview, then lets shots through.
+    private func startLivePreview() async {
+        onLogMessage?("starting live preview…")
+        let running = await Insta360LivePreview.shared.start()
+        onLogMessage?(
+            running
+                ? "ready"
+                : "ready (live preview did not start)"
+        )
+        await MainActor.run { isPipelineReady = true }
     }
 
     func retryConnection() async {
@@ -257,6 +223,7 @@ final class Insta360CaptureManager: ObservableObject {
         }
 
         await MainActor.run { connectedCameras.append(instance) }
+        await startLivePreview()
     }
 
     /// Camera entry for the camera the SDK is connected to: the enabled
@@ -358,6 +325,7 @@ final class Insta360CaptureManager: ObservableObject {
     func disconnect() async {
         warmupTask?.cancel()
         warmupTask = nil
+        await Insta360LivePreview.shared.stop()
         let cameras = await MainActor.run {
             let current = connectedCameras
             connectedCameras = []
@@ -381,7 +349,7 @@ final class Insta360CaptureManager: ObservableObject {
 
     func awaitWarmup() async {
         if let task = warmupTask {
-            onLogMessage?("awaiting pipeline warmup…")
+            onLogMessage?("waiting for the live preview to start…")
             await task.value
             warmupTask = nil
         }
@@ -413,8 +381,7 @@ final class Insta360CaptureManager: ObservableObject {
     func captureWith(
         cameras: [CameraInstance],
         arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8,
-        skipPreChecks: Bool = false,
-        retryOnFailure: Bool = true
+        skipPreChecks: Bool = false
     ) async -> [Insta360CaptureResult] {
         guard !cameras.isEmpty, !Task.isCancelled else { return [] }
 
@@ -429,8 +396,7 @@ final class Insta360CaptureManager: ObservableObject {
                         arkitTimestamp: arkitTimestamp,
                         scanIndex: scanIndex,
                         timeout: timeout,
-                        skipPreChecks: skipPreChecks,
-                        retryOnFailure: retryOnFailure
+                        skipPreChecks: skipPreChecks
                     )
                 }
             }

@@ -8,8 +8,6 @@ struct CameraSettingsView: View {
     @State private var connectionStatus: String?
     @State private var isTesting = false
     @State private var connectionLog: [String] = []
-    @AppStorage(CameraInstance.matchSDKSampleKey)
-    private var matchSDKSample = false
 
     var body: some View {
         List {
@@ -50,21 +48,6 @@ struct CameraSettingsView: View {
                 } label: {
                     Label("Add Insta360 Camera", systemImage: "plus.circle")
                 }
-            }
-
-            Section {
-                Toggle("Match SDK sample exactly", isOn: $matchSDKSample)
-            } header: {
-                Text("Capture Setup")
-            } footer: {
-                Text(
-                    "Uses only the steps of the Insta360 SDK sample's "
-                    + "X5 Take Picture. Skips the app's own camera "
-                    + "settings (single photo mode, both sensors, "
-                    + "FlowState and horizon leveling off) and the "
-                    + "warmup photo. For testing; leave it off for real "
-                    + "captures. Applies at the next connection."
-                )
             }
 
             if !config.cameras.isEmpty {
