@@ -56,6 +56,10 @@ final class CameraInstance: NSObject, Identifiable {
     private var _photoWaiter: ((String, Double) -> Bool)?
     /// When the in-flight takePicture's completion arrived without a URI.
     private var _captureReplyTs: Double?
+    /// The camera's photo list read just before the next takePicture
+    /// (prepareShot). A shot whose URI comes in neither the reply nor
+    /// the push finds its photo as the new entry in a later list.
+    private var _photoListBeforeShot: Set<String>?
 
     /// Shots captured but not yet downloaded.
     var pendingDownloadCount: Int {
@@ -460,11 +464,17 @@ final class CameraInstance: NSObject, Identifiable {
             await prepareShot()
         }
 
+        lock.lock()
+        let photoListBefore = _photoListBeforeShot
+        _photoListBeforeShot = nil
+        lock.unlock()
+
         // One takePicture per shot, as the sample sends one per press.
         // The old retry after a missed reply took a second photo.
         let commandTs = ProcessInfo.processInfo.systemUptime
         let captureResult = await attemptTakePicture(
-            timeout: timeout
+            timeout: timeout,
+            photoListBefore: photoListBefore
         )
 
         if let uri = captureResult?.uri {
@@ -544,6 +554,199 @@ final class CameraInstance: NSObject, Identifiable {
                 "[\(id)] taking the photo without setAppid/PureShot"
             )
         }
+        // Read last, so the list is as close to the shot as possible.
+        let list = await fetchPhotoURIs()
+        lock.lock()
+        _photoListBeforeShot = list
+        lock.unlock()
+        onStatusUpdate?(
+            "[\(id)] photo list before shot: "
+            + (list.map { "\($0.count) photos" } ?? "read failed")
+        )
+    }
+
+    // MARK: - Storage and photo list (API doc, X6 dual storage)
+
+    /// The X6 (SDK name C9) has internal storage and an SD card. The API
+    /// doc reads them separately and lists files with
+    /// hasInternalAndSDStorage = true.
+    private static func isDualStorageCamera() -> Bool {
+        INSCameraManager.shared().currentCamera?.name
+            == kInsta360CameraNameC9
+    }
+
+    private static func cardStateText(
+        _ state: INSCameraCardState
+    ) -> String {
+        switch state {
+        case .normal: return "Normal"
+        case .noCard: return "NoCard"
+        case .noSpace: return "NoSpace"
+        case .invalidFormat: return "InvalidFormat"
+        case .writeProtectCard: return "WriteProtectCard"
+        case .unknownError: return "UnknownError"
+        @unknown default: return "state \(state.rawValue)"
+        }
+    }
+
+    private static func locationText(
+        _ location: INSStorageCardLocation
+    ) -> String {
+        switch location {
+        case .camera: return "camera"
+        case .reader: return "reader"
+        case .inner: return "internal"
+        case .SD: return "SD card"
+        @unknown default: return "location \(location.rawValue)"
+        }
+    }
+
+    private static func storageText(
+        _ status: INSCameraStorageStatus?
+    ) -> String {
+        guard let s = status else { return "none" }
+        let gb = Double(1024 * 1024 * 1024)
+        return Self.cardStateText(s.cardState)
+            + String(
+                format: " %.1f of %.1f GB free",
+                Double(s.freeSpace) / gb, Double(s.totalSpace) / gb
+            )
+    }
+
+    /// Logs the storage the camera captures to, as the API doc's
+    /// "X6 special handling" reads it: the SD card is the
+    /// cardLocation == .SD item of storageStateList, internal storage is
+    /// cameraStorageStatus. storageStatus is the main storage, the one
+    /// photos are written to (sample comment, RootViewController+Sections).
+    func logStorageStatus() async {
+        let text = await withCheckedContinuation {
+            (cont: CheckedContinuation<String, Never>) in
+            let done = NSLock()
+            var finished = false
+
+            func finish(_ value: String) {
+                done.lock()
+                let first = !finished
+                finished = true
+                done.unlock()
+                if first { cont.resume(returning: value) }
+            }
+
+            DispatchQueue.main.async {
+                let dual = Self.isDualStorageCamera()
+                let types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType.storageState.rawValue
+                    ),
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .storageStateList.rawValue
+                    ),
+                ]
+                INSCameraManager.shared().commandManager
+                    .getOptionsWithTypes(types) { error, options, _ in
+                        guard let options else {
+                            finish(
+                                "storage read failed: "
+                                + (error.map { "\($0)" } ?? "no options")
+                            )
+                            return
+                        }
+                        let list = options.storageStateList
+                            as? [INSCameraStorageStatus] ?? []
+                        let main = options.storageStatus.map {
+                            Self.locationText($0.cardLocation)
+                        } ?? "?"
+                        if dual {
+                            let sd = list.first { $0.cardLocation == .SD }
+                            let inner = options.cameraStorageStatus
+                                ?? list.first { $0.cardLocation == .inner }
+                            finish(
+                                "storage: photos go to \(main);"
+                                + " internal \(Self.storageText(inner));"
+                                + " SD card \(Self.storageText(sd))"
+                            )
+                        } else {
+                            finish(
+                                "storage: SD card "
+                                + Self.storageText(options.storageStatus)
+                            )
+                        }
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                finish("storage read timeout")
+            }
+        }
+        onStatusUpdate?("[\(id)] \(text)")
+    }
+
+    /// URIs of every photo on the camera, from fetchPhotoList as the API
+    /// doc's "Get File List" does it. On the X6 the list covers both
+    /// storages: SD card photos are in sdResources (/DCIM/Camera01/...),
+    /// internal ones in cameraResources (/storage_internal/DCIM/...).
+    /// Nil if the list can't be read.
+    private func fetchPhotoURIs() async -> Set<String>? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<Set<String>?, Never>) in
+            let done = NSLock()
+            var finished = false
+
+            func finish(_ value: Set<String>?) {
+                done.lock()
+                let first = !finished
+                finished = true
+                done.unlock()
+                if first { cont.resume(returning: value) }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let dual = Self.isDualStorageCamera()
+                let options = INSGetFileListOptions()
+                options.type = .sdAndCamera
+                options.hasInternalAndSDStorage = dual
+                INSCameraManager.shared().commandManager.fetchPhotoList(
+                    with: options
+                ) { error, res in
+                    var list: [INSCameraBaseFileInfo] = []
+                    if dual {
+                        if let sd = res?.sdResources {
+                            list.append(contentsOf: sd)
+                        }
+                        if let cam = res?.cameraResources {
+                            list.append(contentsOf: cam)
+                        }
+                    } else {
+                        list = res?.cameraResources ?? []
+                    }
+                    if list.isEmpty, let error {
+                        self?.onStatusUpdate?(
+                            "[\(self?.id ?? "?")] photo list: \(error)"
+                        )
+                        finish(nil)
+                        return
+                    }
+                    finish(Set(list.map { $0.uri }.filter { !$0.isEmpty }))
+                }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                finish(nil)
+            }
+        }
+    }
+
+    /// The new photo among `uris`: a .insp or .jpg file if there is one
+    /// (PureShot writes no DNG, but a DNG would come with the photo), and
+    /// of those the last by name, which is the newest (the camera names
+    /// files by date and time; the SDK sample sorts its list this way).
+    private static func newestPhoto(_ uris: Set<String>) -> String? {
+        let images = uris.filter {
+            let ext = ($0 as NSString).pathExtension.lowercased()
+            return ext == "insp" || ext == "jpg" || ext == "jpeg"
+        }
+        return (images.isEmpty ? uris : images).max()
     }
 
     func waitForCommandReady(
@@ -729,9 +932,14 @@ final class CameraInstance: NSObject, Identifiable {
     /// Sends one takePicture and waits for its photo URI. Old firmware
     /// returns the URI in the takePicture completion. New X6 (C9)
     /// firmware returns it in an INSCameraTakePictureResponse push
-    /// instead (handlePhotoPush). The SDK sample handles both.
+    /// instead (handlePhotoPush); the API doc and SDK sample handle both.
+    /// If the reply has no URI, this also checks the camera's photo list
+    /// for the new photo (findNewPhoto), so a push that never comes
+    /// doesn't lose the shot. `photoListBefore` is the list before the
+    /// shot; without it only the reply and the push count.
     private func attemptTakePicture(
-        timeout: Double
+        timeout: Double,
+        photoListBefore: Set<String>? = nil
     ) async -> CaptureAck? {
         return await withTaskCancellationHandler {
             await withCheckedContinuation {
@@ -810,12 +1018,24 @@ final class CameraInstance: NSObject, Identifiable {
                                 )
                             } else {
                                 // No URI and no error: the URI comes in
-                                // a push. Keep waiting until the timeout.
+                                // a push, or the photo shows up in the
+                                // photo list. Wait for either until the
+                                // timeout.
                                 self.lock.lock()
                                 if gen == self._captureGen {
                                     self._captureReplyTs = cbTs
                                 }
                                 self.lock.unlock()
+                                if let before = photoListBefore {
+                                    Task { [weak self] in
+                                        await self?.findNewPhoto(
+                                            gen: gen,
+                                            before: before,
+                                            replyTs: cbTs,
+                                            finish: finish
+                                        )
+                                    }
+                                }
                             }
                         }
                 }
@@ -840,6 +1060,41 @@ final class CameraInstance: NSObject, Identifiable {
             self._photoWaiter = nil
             self.lock.unlock()
             cont?.resume(returning: nil)
+        }
+    }
+
+    /// Reads the photo list every 2 s until it has a photo that wasn't
+    /// there before the shot, then ends the shot with it. Stops when the
+    /// shot ends another way (push, timeout, cancel): `finish` then
+    /// returns false. The first read waits 2 s, while the camera saves
+    /// (capture status submode 3).
+    private func findNewPhoto(
+        gen: UInt64,
+        before: Set<String>,
+        replyTs: Double,
+        finish: @escaping (CaptureAck?) -> Bool
+    ) async {
+        var reads = 0
+        while true {
+            try? await Task.sleep(for: .seconds(2))
+            // Is this shot still waiting?
+            lock.lock()
+            let waiting = gen == _captureGen && _captureCont != nil
+            lock.unlock()
+            guard waiting else { return }
+
+            reads += 1
+            guard let now = await fetchPhotoURIs() else { continue }
+            let added = now.subtracting(before)
+            guard let uri = Self.newestPhoto(added) else { continue }
+            if finish(CaptureAck(uri: uri, callbackTimestamp: replyTs)) {
+                onStatusUpdate?(
+                    "[\(id)] new photo in photo list (read \(reads)):"
+                    + " \(uri)"
+                    + (added.count > 1 ? " (\(added.count) new files)" : "")
+                )
+            }
+            return
         }
     }
 
@@ -1110,10 +1365,15 @@ final class CameraInstance: NSObject, Identifiable {
                                 Double(bytes) / 1_048_576,
                                 ProcessInfo.processInfo
                                     .systemUptime - started)
+                            // X6 internal storage paths start with
+                            // /storage_internal/, SD card paths with
+                            // /DCIM/ (API doc, Get File List).
+                            let from = uri.hasPrefix("/storage_internal/")
+                                ? "internal" : "SD card"
                             self.onStatusUpdate?(
                                 "[\(cameraId)] downloaded"
                                 + " \(destURL.lastPathComponent)"
-                                + " (\(detail))"
+                                + " (\(detail)) from \(from): \(uri)"
                             )
                         }
                     }

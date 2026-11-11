@@ -13,6 +13,9 @@ settings:
     FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/Frameworks
     SWIFT_OBJC_BRIDGING_HEADER: AtlasMobile/AtlasMobile-Bridging-Header.h
     USER_HEADER_SEARCH_PATHS: "$(SRCROOT)/AtlasMobile/Calibration $(SRCROOT)/AtlasMobile/Export"
+    # Required by the Insta360 iOS SDK guide (Getting started, step 2);
+    # the SDK sample project sets it too.
+    GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) TO_B_SDK=1"
 
 targets:
   AtlasMobile:

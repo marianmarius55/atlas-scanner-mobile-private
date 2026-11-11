@@ -180,6 +180,11 @@ final class Insta360CaptureManager: ObservableObject {
 
     /// Starts the live preview, then lets shots through.
     private func startLivePreview() async {
+        // Shows where photos are saved (X6: internal or SD card).
+        let cameras = await MainActor.run { connectedCameras }
+        for cam in cameras {
+            await cam.logStorageStatus()
+        }
         onLogMessage?("starting live preview…")
         let running = await Insta360LivePreview.shared.start()
         onLogMessage?(
