@@ -668,7 +668,7 @@ final class CaptureSessionManager: ObservableObject {
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "12c"
+    private static let buildTag = "12f"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }

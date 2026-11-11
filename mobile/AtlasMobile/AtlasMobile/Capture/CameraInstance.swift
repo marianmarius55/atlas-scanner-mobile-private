@@ -60,6 +60,9 @@ final class CameraInstance: NSObject, Identifiable {
     /// (prepareShot). A shot whose URI comes in neither the reply nor
     /// the push finds its photo as the new entry in a later list.
     private var _photoListBeforeShot: Set<String>?
+    /// setAppid and PureShot have been sent on this connection.
+    /// Cleared when the connection drops, so a reconnect sends them again.
+    private var isPureShotSet = false
 
     /// Shots captured but not yet downloaded.
     var pendingDownloadCount: Int {
@@ -538,21 +541,28 @@ final class CameraInstance: NSObject, Identifiable {
     /// sends takePicture: the live preview runs, and setAppid and PureShot
     /// have just been sent.
     private func prepareShot() async {
-        let previewRunning = await Insta360LivePreview.shared
-            .waitUntilRunning(timeout: 10)
+        // Doesn't wait for the preview to restart after the last shot:
+        // the stream restarts on its own, and waiting delayed every shot.
+        // The sample keeps it running while you take pictures.
+        let previewRunning = await MainActor.run {
+            Insta360LivePreview.shared.isRunning
+        }
         if !previewRunning {
             onStatusUpdate?(
-                "[\(id)] live preview not running"
-                + " — taking the photo anyway"
+                "[\(id)] live preview restarting — not waiting for it"
             )
         }
-        let pureShotSet = await setAppIdAndPureShot()
-        if !pureShotSet {
-            // The sample's plain "Take Picture" button sends takePicture
-            // without them.
-            onStatusUpdate?(
-                "[\(id)] taking the photo without setAppid/PureShot"
-            )
+        // setAppid and PureShot once per connection, not before every
+        // shot as the sample does. Sent again only if they failed.
+        if !isPureShotSet {
+            isPureShotSet = await setAppIdAndPureShot()
+            if !isPureShotSet {
+                // The sample's plain "Take Picture" button sends
+                // takePicture without them.
+                onStatusUpdate?(
+                    "[\(id)] taking the photo without setAppid/PureShot"
+                )
+            }
         }
         // Read last, so the list is as close to the shot as possible.
         let list = await fetchPhotoURIs()
@@ -1063,11 +1073,10 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    /// Reads the photo list every 2 s until it has a photo that wasn't
+    /// Reads the photo list every second until it has a photo that wasn't
     /// there before the shot, then ends the shot with it. Stops when the
-    /// shot ends another way (push, timeout, cancel): `finish` then
-    /// returns false. The first read waits 2 s, while the camera saves
-    /// (capture status submode 3).
+    /// shot ends another way (push, timeout, cancel) or a newer shot
+    /// starts.
     private func findNewPhoto(
         gen: UInt64,
         before: Set<String>,
@@ -1076,7 +1085,9 @@ final class CameraInstance: NSObject, Identifiable {
     ) async {
         var reads = 0
         while true {
-            try? await Task.sleep(for: .seconds(2))
+            // 1 s, not 2: in the logs the photo appeared on the 2nd or
+            // 3rd read, so a shorter interval finds it sooner.
+            try? await Task.sleep(for: .seconds(1))
             // Is this shot still waiting?
             lock.lock()
             let waiting = gen == _captureGen && _captureCont != nil
@@ -1264,6 +1275,9 @@ final class CameraInstance: NSObject, Identifiable {
         clockCont?.resume(returning: fallback)
         captureCont?.resume(returning: nil)
         downloadCont?.resume(returning: nil)
+
+        // A new connection needs setAppid and PureShot again.
+        isPureShotSet = false
     }
 
     private func downloadOne(
