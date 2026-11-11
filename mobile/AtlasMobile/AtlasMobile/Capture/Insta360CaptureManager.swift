@@ -153,9 +153,25 @@ final class Insta360CaptureManager: ObservableObject {
             )
         }
 
+        // The original app's camera settings: single photo mode on both
+        // sensors, FlowState and horizon leveling off. Sent before the
+        // live preview starts, so the preview uses the sensors they set.
+        if commandsReady {
+            await withTaskGroup(of: Void.self) { group in
+                for cam in connected {
+                    group.addTask {
+                        await cam.applyCameraSettings()
+                    }
+                }
+            }
+            onLogMessage?(
+                "camera configured"
+            )
+        }
+
         // Then start the live preview, as the sample's take-picture page
-        // does when it opens. The sample changes no other camera setting
-        // and takes no warmup photo. Shots wait for this task.
+        // does when it opens. No warmup photo: the sample takes none.
+        // Shots wait for this task.
         warmupTask = Task { [weak self] in
             guard let first = connected.first
             else { return }
@@ -172,6 +188,12 @@ final class Insta360CaptureManager: ObservableObject {
                     )
                     return
                 }
+                for cam in connected {
+                    await cam.applyCameraSettings()
+                }
+                self?.onLogMessage?(
+                    "camera configured (deferred)"
+                )
             }
             guard !Task.isCancelled else { return }
             await self?.startLivePreview()
