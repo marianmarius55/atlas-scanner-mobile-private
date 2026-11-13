@@ -60,6 +60,28 @@ final class CameraInstance: NSObject, Identifiable {
     /// (prepareShot). A shot whose URI comes in neither the reply nor
     /// the push finds its photo as the new entry in a later list.
     private var _photoListBeforeShot: Set<String>?
+    /// The camera is taking or saving a photo: set when takePicture is
+    /// sent, cleared when the camera's INSCameraCurrentCaptureStatus push
+    /// reports it isn't capturing. Set at takePicture only once the camera
+    /// has sent such a push on this connection, so a camera that never
+    /// sends them isn't waited for. The X6 ignores a takePicture sent
+    /// while it is still saving: the reply comes at once with no error
+    /// and no photo, and the photo list then shows the last shot's files.
+    private var _cameraBusy = false
+    /// When _cameraBusy last became true (systemUptime).
+    private var _cameraBusySince: Double = 0
+    /// The camera has sent a capture status push on this connection.
+    private var _sawCaptureStatus = false
+    /// When the last capture status push came, when the last push that
+    /// reported a shot in progress came, and when this instance last sent
+    /// takePicture (systemUptime).
+    private var _lastCaptureStatusAt: Double = 0
+    private var _lastBusyStatusAt: Double = 0
+    private var _lastShotSentAt: Double = 0
+    /// A camera still busy this long after it became busy counts as idle,
+    /// so a missed push can't stop 360 shots for good. An X6 shot took
+    /// about 8 s from takePicture to idle.
+    private static let cameraBusyMaxSeconds: Double = 30
     /// setAppid and PureShot have been sent on this connection.
     /// Cleared when the connection drops, so a reconnect sends them again.
     private var isPureShotSet = false
@@ -94,6 +116,7 @@ final class CameraInstance: NSObject, Identifiable {
     private var disconnectToken: NSKeyValueObservation?
     private var photoPushObserver: NSObjectProtocol?
     private var takePictureStateObserver: NSObjectProtocol?
+    private var captureStatusObserver: NSObjectProtocol?
 
     init(config: CameraConfig) {
         self.id = config.id
@@ -550,6 +573,9 @@ final class CameraInstance: NSObject, Identifiable {
     /// sends takePicture: the live preview runs, and setAppid and PureShot
     /// have just been sent.
     private func prepareShot() async {
+        // First, so the photo list below already has the last shot's
+        // .insp. Returns at once when the camera is idle.
+        await waitForCameraIdle()
         // The original app's camera settings: waits for them if they're
         // still being sent at connect, and resends them if they failed.
         await ensurePhotoMode()
@@ -581,10 +607,77 @@ final class CameraInstance: NSObject, Identifiable {
         lock.lock()
         _photoListBeforeShot = list
         lock.unlock()
+        // The shot's photo has to be newer than this one (rejection).
+        let keyed: [(key: String, name: String)] = (list ?? [])
+            .compactMap { uri in
+                Self.photoKey(uri).map {
+                    (key: $0, name: (uri as NSString).lastPathComponent)
+                }
+            }
+        let newest = keyed.max { $0.key < $1.key }?.name
+        let count = list.map { "\($0.count) photos" } ?? "read failed"
+        let newestNote = newest.map { ", newest \($0)" } ?? ""
         onStatusUpdate?(
-            "[\(id)] photo list before shot: "
-            + (list.map { "\($0.count) photos" } ?? "read failed")
+            "[\(id)] photo list before shot: \(count)\(newestNote)"
         )
+    }
+
+    // MARK: - Camera busy / idle
+
+    /// False while the camera is still taking or saving the last photo,
+    /// as its INSCameraCurrentCaptureStatus pushes report (see
+    /// _cameraBusy). Auto capture skips the 360 shot while this is false.
+    var isCameraIdle: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard _cameraBusy else { return true }
+        let busyFor = ProcessInfo.processInfo.systemUptime
+            - _cameraBusySince
+        return busyFor > Self.cameraBusyMaxSeconds
+    }
+
+    /// Waits until the camera reports it has finished the last photo, at
+    /// most cameraBusyMaxSeconds after it became busy. Returns at once
+    /// when it is idle.
+    func waitForCameraIdle() async {
+        guard !isCameraIdle else { return }
+        let start = ProcessInfo.processInfo.systemUptime
+        onStatusUpdate?(
+            "[\(id)] camera still saving the last photo — waiting"
+        )
+        while !isCameraIdle {
+            if Task.isCancelled { return }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        let waited = ProcessInfo.processInfo.systemUptime - start
+        lock.lock()
+        let reportedIdle = !_cameraBusy
+        lock.unlock()
+        let maxWait = Int(Self.cameraBusyMaxSeconds)
+        let text: String = reportedIdle
+            ? String(format: "camera idle after %.1f s", waited)
+            : "camera still busy after \(maxWait) s — taking the photo anyway"
+        onStatusUpdate?("[\(id)] \(text)")
+    }
+
+    /// INSCameraCurrentCaptureStatus push. Any state but .notCapture
+    /// means a shot is being taken or saved. Right after takePicture an
+    /// idle push counts only once the camera has reported the shot, or
+    /// after 1 s, so an idle push sent before the shot can't end it.
+    private func captureStatusChanged(_ status: INSCameraCaptureStatus) {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        _sawCaptureStatus = true
+        _lastCaptureStatusAt = now
+        if status.state != .notCapture {
+            if !_cameraBusy { _cameraBusySince = now }
+            _cameraBusy = true
+            _lastBusyStatusAt = now
+        } else if _lastBusyStatusAt >= _lastShotSentAt
+                    || now - _lastShotSentAt > 1.0 {
+            _cameraBusy = false
+        }
+        lock.unlock()
     }
 
     // MARK: - The original app's camera settings
@@ -1053,16 +1146,49 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    /// The new photo among `uris`: a .insp or .jpg file if there is one
-    /// (PureShot writes no DNG, but a DNG would come with the photo), and
-    /// of those the last by name, which is the newest (the camera names
-    /// files by date and time; the SDK sample sorts its list this way).
-    private static func newestPhoto(_ uris: Set<String>) -> String? {
-        let images = uris.filter {
-            let ext = ($0 as NSString).pathExtension.lowercased()
-            return ext == "insp" || ext == "jpg" || ext == "jpeg"
+    /// The camera names a photo IMG_<date>_<time>_<lens>_<count>, for
+    /// example IMG_20261113_155724_00_017.insp.
+    private static let photoNamePattern = try? NSRegularExpression(
+        pattern: #"(\d{8})_(\d{6})_\d+_(\d+)"#
+    )
+
+    /// Orders photos by when the camera took them: date, time, then the
+    /// count, from the file name. A photo's .insp and .dng have the same
+    /// key. nil if the name doesn't have the camera's form.
+    private static func photoKey(_ uri: String) -> String? {
+        let name = (uri as NSString).lastPathComponent
+        guard let regex = photoNamePattern,
+              let m = regex.firstMatch(
+                in: name, range: NSRange(name.startIndex..., in: name)
+              ),
+              let date = Range(m.range(at: 1), in: name),
+              let time = Range(m.range(at: 2), in: name),
+              let count = Range(m.range(at: 3), in: name)
+        else { return nil }
+        let digits = String(name[count])
+        let padded = String(
+            repeating: "0", count: max(0, 9 - digits.count)
+        ) + digits
+        return String(name[date]) + String(name[time]) + padded
+    }
+
+    /// Why `uri` can't be the new shot's photo, or nil if it can. It has
+    /// to be an .insp: with RAW on, the X6 also writes a .dng of the shot
+    /// a few seconds after the .insp. And it has to be newer than every
+    /// photo on the camera before the shot (`newestBefore` is the largest
+    /// photoKey in that list), so the last shot's photo is never taken.
+    private static func rejection(
+        of uri: String, newestBefore: String?
+    ) -> String? {
+        guard (uri as NSString).pathExtension.lowercased() == "insp"
+        else { return "not an .insp" }
+        guard let key = photoKey(uri) else {
+            return "can't tell from its name when it was taken"
         }
-        return (images.isEmpty ? uris : images).max()
+        if let newestBefore, key <= newestBefore {
+            return "not newer than the photos before the shot"
+        }
+        return nil
     }
 
     func waitForCommandReady(
@@ -1264,11 +1390,16 @@ final class CameraInstance: NSObject, Identifiable {
     /// If the reply has no URI, this also checks the camera's photo list
     /// for the new photo (findNewPhoto), so a push that never comes
     /// doesn't lose the shot. `photoListBefore` is the list before the
-    /// shot; without it only the reply and the push count.
+    /// shot; without it only the reply and the push count. Whichever way
+    /// a URI comes, it counts only if it is an .insp newer than every
+    /// photo in that list (rejection).
     private func attemptTakePicture(
         timeout: Double,
         photoListBefore: Set<String>? = nil
     ) async -> CaptureAck? {
+        // The shot's photo has to be newer than all of these.
+        let newestBefore = photoListBefore?
+            .compactMap { Self.photoKey($0) }.max()
         return await withTaskCancellationHandler {
             await withCheckedContinuation {
                 continuation in
@@ -1277,6 +1408,13 @@ final class CameraInstance: NSObject, Identifiable {
                 let gen = self._captureGen
                 self._captureCont = continuation
                 self._captureReplyTs = nil
+                // Busy from takePicture until the camera reports idle.
+                let sentAt = ProcessInfo.processInfo.systemUptime
+                self._lastShotSentAt = sentAt
+                if self._sawCaptureStatus {
+                    self._cameraBusy = true
+                    self._cameraBusySince = sentAt
+                }
                 self.lock.unlock()
 
                 // Ends this attempt once. Returns false if it had
@@ -1300,6 +1438,16 @@ final class CameraInstance: NSObject, Identifiable {
                 // the completion hasn't arrived yet.
                 self.lock.lock()
                 self._photoWaiter = { uri, pushTs in
+                    if let why = Self.rejection(
+                        of: uri, newestBefore: newestBefore
+                    ) {
+                        self.onStatusUpdate?(
+                            "[\(self.id)] skipped"
+                            + " \((uri as NSString).lastPathComponent):"
+                            + " \(why)"
+                        )
+                        return false
+                    }
                     self.lock.lock()
                     let replyTs = self._captureReplyTs
                     self.lock.unlock()
@@ -1320,22 +1468,42 @@ final class CameraInstance: NSObject, Identifiable {
                         ) { error, photoInfo in
                             let cbTs = ProcessInfo
                                 .processInfo.systemUptime
-                            let uri = Self.photoURI(photoInfo)
+                            let replyURI = Self.photoURI(photoInfo)
+                            // A reply URI has to pass the same checks
+                            // as one from the photo list.
+                            let skip = replyURI.flatMap {
+                                Self.rejection(
+                                    of: $0, newestBefore: newestBefore
+                                )
+                            }
+                            let uri = skip == nil ? replyURI : nil
                             let hdr = photoInfo?.hdrUris?.count ?? 0
                             let burst = photoInfo?.burstUris?.count
                                 ?? 0
                             var note = "[\(self.id)] cb:"
                                 + " gen=\(gen)"
-                                + " uri=\(uri ?? "nil")"
+                                + " uri=\(replyURI ?? "nil")"
                             if hdr > 0 { note += " hdr=\(hdr)" }
                             if burst > 0 { note += " burst=\(burst)" }
                             if let error {
                                 note += " err=\(error)"
+                            } else if let skip {
+                                note += " (skipped: \(skip);"
+                                    + " waiting for the photo)"
                             } else if uri == nil {
                                 note += " (waiting for photo push)"
                             }
                             self.onStatusUpdate?(note)
                             if error != nil {
+                                // No status push since takePicture: the
+                                // camera didn't start a shot, so the next
+                                // one needn't wait for it.
+                                self.lock.lock()
+                                if gen == self._captureGen,
+                                   self._lastCaptureStatusAt < sentAt {
+                                    self._cameraBusy = false
+                                }
+                                self.lock.unlock()
                                 _ = finish(nil)
                             } else if let uri {
                                 _ = finish(
@@ -1359,6 +1527,7 @@ final class CameraInstance: NSObject, Identifiable {
                                         await self?.findNewPhoto(
                                             gen: gen,
                                             before: before,
+                                            newestBefore: newestBefore,
                                             replyTs: cbTs,
                                             finish: finish
                                         )
@@ -1391,17 +1560,20 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    /// Reads the photo list every second until it has a photo that wasn't
-    /// there before the shot, then ends the shot with it. Stops when the
-    /// shot ends another way (push, timeout, cancel) or a newer shot
-    /// starts.
+    /// Reads the photo list every second until it has a new .insp that is
+    /// newer than every photo before the shot (rejection), then ends the
+    /// shot with it. Other new files, such as the last shot's .dng, are
+    /// logged once and passed over. Stops when the shot ends another way
+    /// (push, timeout, cancel) or a newer shot starts.
     private func findNewPhoto(
         gen: UInt64,
         before: Set<String>,
+        newestBefore: String?,
         replyTs: Double,
         finish: @escaping (CaptureAck?) -> Bool
     ) async {
         var reads = 0
+        var passedOver: Set<String> = []
         while true {
             // 1 s, not 2: in the logs the photo appeared on the 2nd or
             // 3rd read, so a shorter interval finds it sooner.
@@ -1414,13 +1586,34 @@ final class CameraInstance: NSObject, Identifiable {
 
             reads += 1
             guard let now = await fetchPhotoURIs() else { continue }
-            let added = now.subtracting(before)
-            guard let uri = Self.newestPhoto(added) else { continue }
-            if finish(CaptureAck(uri: uri, callbackTimestamp: replyTs)) {
+            var photos: [(key: String, uri: String)] = []
+            for uri in now.subtracting(before) {
+                if let why = Self.rejection(
+                    of: uri, newestBefore: newestBefore
+                ) {
+                    if passedOver.insert(uri).inserted {
+                        onStatusUpdate?(
+                            "[\(id)] skipped"
+                            + " \((uri as NSString).lastPathComponent):"
+                            + " \(why)"
+                        )
+                    }
+                } else if let key = Self.photoKey(uri) {
+                    photos.append((key: key, uri: uri))
+                }
+            }
+            // Normally one. If more, the newest is closest to this shot.
+            guard let photo = photos.max(by: { $0.key < $1.key })
+            else { continue }
+            if finish(
+                CaptureAck(uri: photo.uri, callbackTimestamp: replyTs)
+            ) {
                 onStatusUpdate?(
                     "[\(id)] new photo in photo list (read \(reads)):"
-                    + " \(uri)"
-                    + (added.count > 1 ? " (\(added.count) new files)" : "")
+                    + " \(photo.uri)"
+                    + (photos.count > 1
+                        ? " (\(photos.count) new photos, took the newest)"
+                        : "")
                 )
             }
             return
@@ -1470,21 +1663,41 @@ final class CameraInstance: NSObject, Identifiable {
                     )
                 }
         }
+        // Tells when the camera has finished a photo (isCameraIdle).
+        // Insta360LivePreview logs these pushes and observes them too.
+        if captureStatusObserver == nil {
+            captureStatusObserver = NotificationCenter.default
+                .addObserver(
+                    forName: .INSCameraCurrentCaptureStatus,
+                    object: nil,
+                    queue: nil
+                ) { [weak self] note in
+                    guard let status = note.userInfo?["status"]
+                        as? INSCameraCaptureStatus
+                    else { return }
+                    self?.captureStatusChanged(status)
+                }
+        }
     }
 
     private func stopPhotoPushObserver() {
-        for token in [photoPushObserver, takePictureStateObserver] {
+        for token in [
+            photoPushObserver, takePictureStateObserver,
+            captureStatusObserver,
+        ] {
             if let token {
                 NotificationCenter.default.removeObserver(token)
             }
         }
         photoPushObserver = nil
         takePictureStateObserver = nil
+        captureStatusObserver = nil
     }
 
     /// userInfo["photo"] is an INSCameraPhotoInfo. The push goes to the
-    /// takePicture in flight; with none in flight it is ignored (for
-    /// example a photo taken with the camera's own button).
+    /// takePicture in flight, which uses it only if it passes rejection;
+    /// with none in flight it is ignored (for example a photo taken with
+    /// the camera's own button).
     private func handlePhotoPush(_ note: Notification) {
         let info = note.userInfo?["photo"] as? INSCameraPhotoInfo
         guard let uri = Self.photoURI(info) else {
@@ -1499,7 +1712,7 @@ final class CameraInstance: NSObject, Identifiable {
         ) ?? false
         onStatusUpdate?(
             "[\(id)] photo push: uri=\(uri)"
-            + (used ? "" : " (no shot waiting, ignored)")
+            + (used ? "" : " (not used)")
         )
     }
 
@@ -1575,6 +1788,13 @@ final class CameraInstance: NSObject, Identifiable {
         _captureInFlight = false
         _photoWaiter = nil
         _captureReplyTs = nil
+        // A new connection starts with an idle camera that hasn't sent a
+        // capture status push yet.
+        _cameraBusy = false
+        _sawCaptureStatus = false
+        _lastCaptureStatusAt = 0
+        _lastBusyStatusAt = 0
+        _lastShotSentAt = 0
         if clearURIs {
             _pendingURIs.removeAll()
             _downloadAttempts.removeAll()

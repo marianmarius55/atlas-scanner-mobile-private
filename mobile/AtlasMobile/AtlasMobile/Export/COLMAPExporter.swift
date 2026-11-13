@@ -91,6 +91,12 @@ final class COLMAPExporter {
     /// in a 9-minute walk were mostly 0.6-2 deg/s; bad ones 3.2-7.7.
     static let x5MaxMeanDps: Double = 3.0
     static let x5ShutterDelay: Double = 1.0
+    /// A 360 photo whose time (EXIF time minus its shot's command time)
+    /// is further than this from the session's usual value belongs to
+    /// another shot and is dropped. In one X6 session the right photos
+    /// were within 0.7 s of the usual value; photos of the previous shot
+    /// were 4.9 s and 7.6 s early.
+    static let x5MaxTimeMismatch: Double = 2.0
 
     /// Seed extrinsic → ERP-from-ARKit 4x4 for composing with T_wc.inverse.
     static func erpFromARKit(_ ext: RigidTransform) -> simd_float4x4 {
@@ -201,15 +207,144 @@ final class COLMAPExporter {
                 note)
     }
 
+    /// Drops 360 photos whose time doesn't match their shutter command,
+    /// so a photo of another shot can't reach the model. A photo's offset
+    /// is its EXIF time (exif_timestamp) minus its command time
+    /// (command_timestamp), both from the scan's pose.json. The two are on
+    /// different clocks, so right photos share about the same offset all
+    /// session. The usual offset is the median of the largest group of
+    /// offsets within x5MaxTimeMismatch of each other. A photo further
+    /// than that from it is dropped, and so is one with no EXIF time (a
+    /// DNG saved as the photo has none). The scan's iPhone frame is kept.
+    /// A camera none of whose photos has a time isn't checked.
+    static func checkX5PhotoTimes(
+        scans: [ScanExportData],
+        sessionDirectory: URL
+    ) -> (scans: [ScanExportData], note: String) {
+        // Offset per scan and camera; no entry without an EXIF time.
+        var offsets: [[String: Double]] = []
+        for scan in scans {
+            var row: [String: Double] = [:]
+            let url = sessionDirectory.appendingPathComponent(
+                "raw/iphone/\(scan.scanName)/pose.json")
+            if !scan.insta360ImageURLs.isEmpty,
+               let data = try? Data(contentsOf: url),
+               let pose = try? JSONDecoder().decode(
+                ScanPose.self, from: data)
+            {
+                for c in pose.insta360Captures {
+                    if let exif = c.exifTimestamp {
+                        row[c.cameraId] = exif - c.commandTimestamp
+                    }
+                }
+            }
+            offsets.append(row)
+        }
+        var byCamera: [String: [Double]] = [:]
+        for (i, scan) in scans.enumerated() {
+            for camId in scan.insta360ImageURLs.keys {
+                if let offset = offsets[i][camId] {
+                    byCamera[camId, default: []].append(offset)
+                }
+            }
+        }
+        let usual = byCamera.mapValues { usualOffset($0) }
+
+        var total = 0
+        var dropped: [String] = []
+        var unchecked: Set<String> = []
+        var kept: [ScanExportData] = []
+        for (i, scan) in scans.enumerated() {
+            var urls = scan.insta360ImageURLs
+            for camId in scan.insta360ImageURLs.keys.sorted() {
+                total += 1
+                guard let ref = usual[camId] else {
+                    unchecked.insert(camId)
+                    continue
+                }
+                guard let offset = offsets[i][camId] else {
+                    urls[camId] = nil
+                    dropped.append(
+                        "\(scan.scanName) x5-\(camId)(no photo time)")
+                    continue
+                }
+                let d = offset - ref
+                if abs(d) > Self.x5MaxTimeMismatch {
+                    urls[camId] = nil
+                    let secs = String(format: "%.1f", abs(d))
+                    dropped.append(
+                        "\(scan.scanName) x5-\(camId)(photo taken"
+                        + " \(secs) s \(d < 0 ? "before" : "after")"
+                        + " its shot)")
+                }
+            }
+            if urls.count == scan.insta360ImageURLs.count {
+                kept.append(scan)
+            } else {
+                kept.append(ScanExportData(
+                    scanName: scan.scanName,
+                    arkitPose: scan.arkitPose,
+                    intrinsics: scan.intrinsics,
+                    imageWidth: scan.imageWidth,
+                    imageHeight: scan.imageHeight,
+                    depthBinURL: scan.depthBinURL,
+                    smoothedDepthBinURL: scan.smoothedDepthBinURL,
+                    iphoneImageURL: scan.iphoneImageURL,
+                    insta360ImageURLs: urls,
+                    insta360CommandTimestamp:
+                        scan.insta360CommandTimestamp))
+            }
+        }
+        var note = "photo time check: kept \(total - dropped.count)"
+            + " of \(total) 360 photos"
+        if !dropped.isEmpty {
+            note += "; dropped \(dropped.count): "
+                + dropped.joined(separator: ", ")
+        }
+        if !unchecked.isEmpty {
+            note += "; no photo times for "
+                + unchecked.sorted().joined(separator: ", ")
+                + ", not checked"
+        }
+        return (kept, note)
+    }
+
+    /// The median of the largest group of `values` that lie within
+    /// x5MaxTimeMismatch of each other, so a run of wrong photos can't
+    /// move it. `values` isn't empty.
+    private static func usualOffset(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        var best = 0..<0
+        var end = 0
+        for start in sorted.indices {
+            while end < sorted.count,
+                  sorted[end] - sorted[start] <= x5MaxTimeMismatch {
+                end += 1
+            }
+            if end - start > best.count { best = start..<end }
+        }
+        let group = sorted[best]
+        let mid = group.startIndex + group.count / 2
+        return group.count % 2 == 1
+            ? group[mid]
+            : (group[mid - 1] + group[mid]) / 2
+    }
+
     /// Writes cameras.bin, images.bin, points3D.bin, rigs.bin, and frames.bin.
     /// `onStage` receives a short description of each step, called on
     /// the exporting thread.
     func export(
-        scans: [ScanExportData],
+        scans uncheckedScans: [ScanExportData],
         cameraConfig: MultiCameraConfig,
         cameraExportMode: CameraExportMode = .pinholeTiles,
         onStage: ((String) -> Void)? = nil
     ) throws {
+        // Every export drops 360 photos of the wrong shot first.
+        let timeCheck = Self.checkX5PhotoTimes(
+            scans: uncheckedScans, sessionDirectory: sessionDirectory)
+        let scans = timeCheck.scans
+        print("[Export] \(timeCheck.note)")
+        ExportTrace.note(timeCheck.note)
         let rcQ = simd_quatf(Self.rigCorrection)
         let rcDeg = 2 * acos(min(abs(rcQ.real), 1.0))
             * 180.0 / Float.pi

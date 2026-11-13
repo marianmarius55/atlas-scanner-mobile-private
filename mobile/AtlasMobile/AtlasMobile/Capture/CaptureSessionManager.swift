@@ -333,8 +333,19 @@ final class CaptureSessionManager: ObservableObject {
             let activeCams = enabledCameras
             var sent360 = false
             let motionOk = smoothedAngularRateDps < 2.0
+            // The X6 ignores a takePicture while it's still saving the
+            // last photo. Auto mode doesn't wait: it skips the 360 shot
+            // for this scan, as it does when the phone is moving.
+            let cameraIdle = activeCams.allSatisfy { $0.isCameraIdle }
             if !isInsta360Busy, !activeCams.isEmpty,
-               isAutoCapturing, motionOk
+               isAutoCapturing, motionOk, !cameraIdle
+            {
+                logMessage(
+                    "auto: 360 camera still saving — no 360 shot this scan"
+                )
+            }
+            if !isInsta360Busy, !activeCams.isEmpty,
+               isAutoCapturing, motionOk, cameraIdle
             {
                 isInsta360Busy = true
                 insta360CommandCount += 1
@@ -462,6 +473,11 @@ final class CaptureSessionManager: ObservableObject {
             var manualMotion: (peakDps: Double, meanDps: Double)?
             let manualCams = enabledCameras
             if !manualCams.isEmpty {
+                // Before the steady wait, so the shot still fires when
+                // the phone is steady. Each camera logs its wait.
+                for cam in manualCams {
+                    await cam.waitForCameraIdle()
+                }
                 if smoothedAngularRateDps >= 2.0 {
                     logMessage("waiting for steady…")
                     x5HoldSteady = true
@@ -668,7 +684,7 @@ final class CaptureSessionManager: ObservableObject {
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "12h"
+    private static let buildTag = "12i"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }

@@ -337,12 +337,16 @@ struct SessionExportView: View {
                         sessionDirectory: dir),
                     config: MultiCameraConfig
                         .loadFromDeviceOrBundle())
-                let scans = one.scans
+                // Calibrate without 360 photos of the wrong shot; the
+                // COLMAP export (phase 2) runs the same check.
+                let timeCheck = COLMAPExporter.checkX5PhotoTimes(
+                    scans: one.scans, sessionDirectory: dir)
+                let scans = timeCheck.scans
                 let cfg = one.config
                 let traj = COLMAPExporter
                     .loadTrajectory(
                         sessionDirectory: dir)
-                let withX5 = scans.filter {
+                let withX5 = one.scans.filter {
                     !$0.insta360ImageURLs.isEmpty
                 }.count
                 ExportTrace.note(
@@ -350,6 +354,8 @@ struct SessionExportView: View {
                         + " a 360 image), trajectory"
                         + " \(traj?.count ?? 0) poses")
                 ExportTrace.note(one.note)
+                print("[Export] \(timeCheck.note)")
+                ExportTrace.note(timeCheck.note)
                 let docs = fm.urls(
                     for: .documentDirectory,
                     in: .userDomainMask).first
