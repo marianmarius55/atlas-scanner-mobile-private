@@ -640,7 +640,16 @@ final class COLMAPExporter {
                 )
 
             try writeImagesBin(entries: imageEntries)
-            try writePoints3DBin(points: allPoints)
+            onStage?("adding LiDAR frames (\(Self.memorySummary()))")
+            let lidar = lidarFramePoints()
+            if lidar.frames > 0 {
+                let note = "LiDAR frames: \(lidar.frames) frames saved"
+                    + " between photos added \(lidar.points.count) points"
+                    + " to the \(allPoints.count) of the photos"
+                print("[Export] \(note)")
+                ExportTrace.note(note)
+            }
+            try writePoints3DBin(points: allPoints + lidar.points)
 
             if hasInsta360 {
                 try writeRigsBin(
@@ -932,8 +941,12 @@ final class COLMAPExporter {
                         p_arkit.z
                     )
 
-                let sampleW = pixels?.w ?? imgW
-                let sampleH = pixels?.h ?? imgH
+                // sampleColor takes the landscape size of the photo;
+                // rgb.jpg is portrait, so its height is that width.
+                // (Passing w and h made a quarter of the points gray
+                // and took the rest from the wrong place.)
+                let sampleW = pixels?.h ?? imgW
+                let sampleH = pixels?.w ?? imgH
                 let rgb = Self.sampleColor(
                     pixels: pixels,
                     lidarCol: col, lidarRow: row,
@@ -1070,6 +1083,131 @@ final class COLMAPExporter {
             data.appendLE(UInt64(0))  // no 2D points
         }
         try data.write(to: sparseDir.appendingPathComponent("images.bin"))
+    }
+
+    // MARK: - LiDAR frames
+
+    /// One point per 2 cm cell for the LiDAR frames' points.
+    static let lidarFrameCell: Float = 0.02
+    /// Memory cap for the LiDAR frames' points (about 32 MB).
+    static let maxLidarFramePoints = 1_000_000
+
+    /// Points of the LiDAR frames that LiDARFrameRecorder saved between
+    /// photos (raw/lidar_frames), in COLMAP coordinates, coloured from
+    /// each frame's small colour image. Every 4th depth pixel at
+    /// 0.1–5 m, as in unprojectDepth, but only medium or high
+    /// confidence (hundreds of moving views would add a lot of edge
+    /// noise) and one point per 2 cm cell. Empty for older sessions.
+    private func lidarFramePoints() -> (points: [ColoredPoint], frames: Int) {
+        let dir = sessionDirectory.appendingPathComponent(
+            LiDARFrameRecorder.folder)
+        guard let index = try? String(
+                  contentsOf: dir.appendingPathComponent(
+                      LiDARFrameRecorder.indexFile),
+                  encoding: .utf8),
+              let handle = try? FileHandle(
+                  forReadingFrom: dir.appendingPathComponent(
+                      LiDARFrameRecorder.dataFile))
+        else { return ([], 0) }
+        defer { try? handle.close() }
+
+        let decoder = JSONDecoder()
+        var seen = Set<Int64>()
+        var points: [ColoredPoint] = []
+        var frames = 0
+        for line in index.split(separator: "\n") {
+            if points.count >= Self.maxLidarFramePoints { break }
+            autoreleasepool {
+                guard let rec = try? decoder.decode(
+                          LiDARFrameRecord.self, from: Data(line.utf8)),
+                      let bytes = Self.readLidarFrame(rec, from: handle)
+                else { return }
+                frames += 1
+                Self.addLidarFramePoints(
+                    rec, bytes: bytes, seen: &seen, points: &points)
+            }
+        }
+        return (points, frames)
+    }
+
+    private static func readLidarFrame(
+        _ rec: LiDARFrameRecord, from handle: FileHandle
+    ) -> Data? {
+        guard rec.byteCount > 0,
+              (try? handle.seek(toOffset: rec.offset)) != nil,
+              let data = try? handle.read(upToCount: rec.byteCount),
+              data.count == rec.byteCount
+        else { return nil }
+        return data
+    }
+
+    private static func addLidarFramePoints(
+        _ rec: LiDARFrameRecord,
+        bytes: Data,
+        seen: inout Set<Int64>,
+        points: inout [ColoredPoint]
+    ) {
+        let K = rec.intrinsics
+        guard let T = rec.cameraToWorld,
+              K.count == 3, K.allSatisfy({ $0.count == 3 }),
+              rec.imageWidth > 0, rec.imageHeight > 0
+        else { return }
+        let w = rec.depthWidth
+        let h = rec.depthHeight
+        let n = w * h
+        let rgbW = rec.rgbWidth
+        let rgbH = rec.rgbHeight
+        let depth: [Float] = bytes.prefix(n * 4).withUnsafeBytes {
+            Array($0.bindMemory(to: Float.self))
+        }
+        let confidence = [UInt8](bytes[(n * 4)..<(n * 5)])
+        let rgb = [UInt8](bytes[(n * 5)...])
+        guard depth.count == n, confidence.count == n,
+              rgb.count == rgbW * rgbH * 3
+        else { return }
+
+        let sx = Float(w) / Float(rec.imageWidth)
+        let sy = Float(h) / Float(rec.imageHeight)
+        let fx = K[0][0] * sx, fy = K[1][1] * sy
+        let cx = K[0][2] * sx, cy = K[1][2] * sy
+        guard fx > 0, fy > 0 else { return }
+
+        let off: Int64 = 1 << 20
+        let limit = Float(off)
+        let step = 4
+        for row in Swift.stride(from: 0, to: h, by: step) {
+            for col in Swift.stride(from: 0, to: w, by: step) {
+                if points.count >= maxLidarFramePoints { return }
+                let i = row * w + col
+                let z = depth[i]
+                guard z > 0.1, z < 5.0, confidence[i] >= 1 else {
+                    continue
+                }
+                let p = T * SIMD4<Float>(
+                    (Float(col) - cx) / fx * z,
+                    -(Float(row) - cy) / fy * z,
+                    -z, 1)
+                let pc = Self.arkitToColmap * SIMD3(p.x, p.y, p.z)
+                let cell = (pc / lidarFrameCell).rounded(.down)
+                guard abs(cell.x) < limit, abs(cell.y) < limit,
+                      abs(cell.z) < limit
+                else { continue }
+                let key = ((Int64(cell.x) + off) << 42)
+                    | ((Int64(cell.y) + off) << 21)
+                    | (Int64(cell.z) + off)
+                guard seen.insert(key).inserted else { continue }
+                var r: UInt8 = 128, g: UInt8 = 128, b: UInt8 = 128
+                if rgbW > 0, rgbH > 0 {
+                    let c = (min(rgbH - 1, row / 2) * rgbW
+                        + min(rgbW - 1, col / 2)) * 3
+                    r = rgb[c]
+                    g = rgb[c + 1]
+                    b = rgb[c + 2]
+                }
+                points.append(ColoredPoint(
+                    position: pc, r: r, g: g, b: b))
+            }
+        }
     }
 
     // MARK: - points3D.bin

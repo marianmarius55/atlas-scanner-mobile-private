@@ -13,7 +13,9 @@ struct ContentView: View {
                     ARCameraView(
                         session: session,
                         showMesh: sessionManager.showMesh,
-                        showPointCloud: sessionManager.showPointCloud
+                        showPointCloud: sessionManager.showPointCloud,
+                        coverage: sessionManager.coverageMap,
+                        showCoverage: sessionManager.showCoverage
                     )
                     .ignoresSafeArea()
 

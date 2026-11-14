@@ -82,6 +82,11 @@ struct CaptureOverlayView: View {
                         }
                     }
 
+                    // ── Coverage legend ──
+                    if sessionManager.showCoverage {
+                        CoverageLegend()
+                    }
+
                     // ── Camera status row ──
                     if let status = sessionManager.cameraStatus {
                         HStack(spacing: 6) {
@@ -377,6 +382,10 @@ struct CaptureOverlayView: View {
                         VisToggle(icon: "circle.dotted", active: sessionManager.showPointCloud) {
                             sessionManager.togglePointCloud()
                         }
+                        // Coverage: where the export has LiDAR
+                        VisToggle(icon: "square.dashed", active: sessionManager.showCoverage) {
+                            sessionManager.toggleCoverage()
+                        }
                         VisToggle(
                             icon: sessionManager.showDepthOverlay ? "xmark" : "camera.filters",
                             active: sessionManager.showDepthOverlay
@@ -555,6 +564,34 @@ private struct VisToggle: View {
                 .background(.ultraThinMaterial)
                 .overlay(active ? Color.yellow.opacity(0.2) : Color.clear)
                 .clipShape(Circle())
+        }
+    }
+}
+
+/// Key for the coverage dots drawn by ARCameraView (CoverageMap colours).
+private struct CoverageLegend: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            item(.green, "LiDAR + sharp photo")
+            item(.yellow, "LiDAR only")
+            Text("No dots: not scanned")
+        }
+        .font(.caption.weight(.medium))
+        .foregroundColor(.white)
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial)
+        .cornerRadius(8)
+    }
+
+    private func item(_ color: Color, _ label: String) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(label)
         }
     }
 }

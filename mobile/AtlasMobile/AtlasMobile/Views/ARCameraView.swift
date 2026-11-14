@@ -6,9 +6,13 @@ struct ARCameraView: UIViewRepresentable {
     let session: ARSession
     var showMesh: Bool
     var showPointCloud: Bool
+    /// LiDAR coverage of the session, drawn as dots when showCoverage
+    /// is on.
+    let coverage: CoverageMap
+    var showCoverage: Bool
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(coverage: coverage)
     }
 
     func makeUIView(context: Context) -> ARSCNView {
@@ -18,12 +22,17 @@ struct ARCameraView: UIViewRepresentable {
         scnView.rendersCameraGrain = true
         scnView.contentMode = .scaleAspectFill
         scnView.delegate = context.coordinator
+        // The root node is ARKit's world frame, the frame of the
+        // coverage map's points.
+        scnView.scene.rootNode.addChildNode(
+            context.coordinator.coverageNode)
         return scnView
     }
 
     func updateUIView(_ uiView: ARSCNView, context: Context) {
         let coord = context.coordinator
         coord.showMesh = showMesh
+        coord.coverageNode.isHidden = !showCoverage
 
         if showPointCloud {
             uiView.debugOptions.insert(.showFeaturePoints)
@@ -40,6 +49,33 @@ struct ARCameraView: UIViewRepresentable {
 
     final class Coordinator: NSObject, ARSCNViewDelegate {
         var showMesh = false
+        /// The coverage map's cells as points.
+        let coverageNode: SCNNode
+        private let coverage: CoverageMap
+        /// Version of the snapshot coverageNode shows. Render thread only.
+        private var coverageVersion = -1
+
+        init(coverage: CoverageMap) {
+            self.coverage = coverage
+            let node = SCNNode()
+            node.name = "coverage"
+            node.isHidden = true
+            self.coverageNode = node
+            super.init()
+        }
+
+        /// Swaps in the new point cloud after the map changes (once per
+        /// saved scan). Called on SceneKit's render thread before each
+        /// frame, the place for scene changes.
+        func renderer(
+            _ renderer: SCNSceneRenderer,
+            updateAtTime time: TimeInterval
+        ) {
+            let snap = coverage.snapshot()
+            guard snap.version != coverageVersion else { return }
+            coverageVersion = snap.version
+            coverageNode.geometry = Self.pointCloud(snap)
+        }
 
         func renderer(
             _ renderer: SCNSceneRenderer,
@@ -60,6 +96,53 @@ struct ARCameraView: UIViewRepresentable {
             if showMesh {
                 node.addChildNode(buildMeshNode(from: meshAnchor))
             }
+        }
+
+        /// One unlit dot per 5 cm cell, coloured per cell.
+        private static func pointCloud(
+            _ snap: CoverageMap.Snapshot
+        ) -> SCNGeometry? {
+            guard snap.count > 0 else { return nil }
+            let floatSize = MemoryLayout<Float>.size
+            let vertices = SCNGeometrySource(
+                data: snap.positions,
+                semantic: .vertex,
+                vectorCount: snap.count,
+                usesFloatComponents: true,
+                componentsPerVector: 3,
+                bytesPerComponent: floatSize,
+                dataOffset: 0,
+                dataStride: 3 * floatSize
+            )
+            let colors = SCNGeometrySource(
+                data: snap.colors,
+                semantic: .color,
+                vectorCount: snap.count,
+                usesFloatComponents: true,
+                componentsPerVector: 3,
+                bytesPerComponent: floatSize,
+                dataOffset: 0,
+                dataStride: 3 * floatSize
+            )
+            let element = SCNGeometryElement(
+                data: snap.indices,
+                primitiveType: .point,
+                primitiveCount: snap.count,
+                bytesPerIndex: MemoryLayout<UInt32>.size
+            )
+            // Cell-sized dots, clamped on screen: near walls get a dot
+            // grid you can see through, far ones stay visible.
+            element.pointSize = CGFloat(CoverageMap.cellSize)
+            element.minimumPointScreenSpaceRadius = 2
+            element.maximumPointScreenSpaceRadius = 8
+
+            let geometry = SCNGeometry(
+                sources: [vertices, colors], elements: [element])
+            let material = SCNMaterial()
+            material.lightingModel = .constant
+            material.diffuse.contents = UIColor.white
+            geometry.materials = [material]
+            return geometry
         }
 
         private func buildMeshNode(from meshAnchor: ARMeshAnchor) -> SCNNode {

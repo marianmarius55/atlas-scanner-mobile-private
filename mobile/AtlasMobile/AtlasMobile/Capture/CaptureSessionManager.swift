@@ -21,6 +21,10 @@ final class CaptureSessionManager: ObservableObject {
     @Published var showDepthOverlay = false
     @Published var showMesh = false
     @Published var showPointCloud = false
+    /// Coverage view: dots where the export has LiDAR of the room, green
+    /// where a sharp photo saw it too, yellow where only LiDAR frames
+    /// (saved between photos) did.
+    @Published var showCoverage = false
     @Published var depthOverlayImage: UIImage?
     @Published var calibCheckImage: UIImage?
     @Published var showCalibCheck = false
@@ -29,12 +33,16 @@ final class CaptureSessionManager: ObservableObject {
 
     /// ARKit capture — exposed for CalibrationView.
     let arkitCapture = ARKitCapture()
+    /// LiDAR coverage of this session, drawn by ARCameraView.
+    let coverageMap = CoverageMap()
     private var insta360Manager = Insta360CaptureManager()
     private var pipelineSink: AnyCancellable?
     private var camerasSink: AnyCancellable?
     private let maskManager = MaskManager()
     private var dataRecorder: DataRecorder?
     private var trajectoryRecorder: TrajectoryRecorder?
+    /// Saves LiDAR depth between photos (raw/lidar_frames).
+    private var lidarFrameRecorder: LiDARFrameRecorder?
 
     /// Last downloaded Insta360 ERP — exposed for CalibrationView.
     @Published var lastInstaERP: UIImage?
@@ -223,8 +231,13 @@ final class CaptureSessionManager: ObservableObject {
         dataRecorder = DataRecorder(sessionDirectory: sessionDir)
         sessionDirectory = sessionDir
         trajectoryRecorder = TrajectoryRecorder()
+        // Before ARKit starts: the LiDAR frames feed the coverage map.
+        coverageMap.reset()
+        lidarFrameRecorder = LiDARFrameRecorder(
+            sessionDirectory: sessionDir, coverage: coverageMap)
 
         arkitCapture.trajectoryRecorder = trajectoryRecorder
+        arkitCapture.lidarFrameRecorder = lidarFrameRecorder
         arkitCapture.start()
 
         let configuredCount = insta360Manager.cameraConfig.cameras.count
@@ -237,6 +250,7 @@ final class CaptureSessionManager: ObservableObject {
         isSessionActive = true
         isReadyToCapture = true
         scanCount = 0
+        lastSavedScan = nil
         startDiskSpaceMonitor()
 
         setupDisconnectHandler()
@@ -286,6 +300,47 @@ final class CaptureSessionManager: ObservableObject {
         guard let arkitFrame = arkitCapture.captureCurrentFrame() else {
             return
         }
+        let fast = isAutoCapturing
+        let motionOk = smoothedAngularRateDps < 2.0
+        // Auto mode fires a 360 shot when the phone is steady and the
+        // 360 camera is free. The X6 ignores a takePicture while it's
+        // still saving the last photo, so auto mode doesn't wait: it
+        // skips the 360 shot for this scan, as it does when the phone
+        // is moving.
+        let activeCams = enabledCameras
+        let cameraIdle = activeCams.allSatisfy { $0.isCameraIdle }
+        let can360 = fast && !isInsta360Busy && !activeCams.isEmpty
+            && motionOk
+        let fires360 = can360 && cameraIdle
+
+        // While you wait for the 360 camera, auto mode saved the same
+        // view every 2.5 s. A scan without a 360 shot is now saved only
+        // at a new spot: 10 cm or 10° from the last saved scan, the
+        // rule of the LiDAR frames.
+        if fast, !fires360, let last = lastSavedScan {
+            let m = PoseInterpolation.movement(
+                from: last.pose, to: arkitFrame.pose)
+            let sameSpot = m.metres < Self.newSpotMove
+                && m.degrees < Self.newSpotTurnDeg
+            // Without a 360 camera no 360-shot scan brings a steady
+            // photo of the spot, so one steady scan is still saved
+            // where the last one was taken while turning.
+            let steadierPhoto = activeCams.isEmpty && motionOk
+                && !last.steady
+            if sameSpot && !steadierPhoto {
+                var line = String(
+                    format: "auto: same spot as scan#%ld"
+                        + " (%.0f cm, %.0f°), not saved",
+                    last.index, Double(m.metres) * 100,
+                    Double(m.degrees))
+                if can360 && !cameraIdle {
+                    line += "; 360 camera still saving"
+                }
+                logMessage(line)
+                return
+            }
+        }
+
         let frameAge = CACurrentMediaTime()
             - arkitFrame.timestamp
         let nearestTrajTs = trajectoryRecorder?
@@ -293,7 +348,6 @@ final class CaptureSessionManager: ObservableObject {
 
         let currentScan = scanCount
         scanCount += 1
-        let fast = isAutoCapturing
 
         let frameAgeMs = frameAge * 1000
         let trajDeltaMs: Double? = nearestTrajTs.map {
@@ -330,23 +384,13 @@ final class CaptureSessionManager: ObservableObject {
         guard isSessionActive, !isEndingSession else { return }
 
         if fast {
-            let activeCams = enabledCameras
             var sent360 = false
-            let motionOk = smoothedAngularRateDps < 2.0
-            // The X6 ignores a takePicture while it's still saving the
-            // last photo. Auto mode doesn't wait: it skips the 360 shot
-            // for this scan, as it does when the phone is moving.
-            let cameraIdle = activeCams.allSatisfy { $0.isCameraIdle }
-            if !isInsta360Busy, !activeCams.isEmpty,
-               isAutoCapturing, motionOk, !cameraIdle
-            {
+            if can360, !cameraIdle {
                 logMessage(
                     "auto: 360 camera still saving — no 360 shot this scan"
                 )
             }
-            if !isInsta360Busy, !activeCams.isEmpty,
-               isAutoCapturing, motionOk, cameraIdle
-            {
+            if fires360 {
                 isInsta360Busy = true
                 insta360CommandCount += 1
                 let cmdNum = insta360CommandCount
@@ -456,6 +500,10 @@ final class CaptureSessionManager: ObservableObject {
                 frameAgeMs: frameAgeMs,
                 trajectoryDeltaMs: trajDeltaMs
             )
+            addToCoverage(scanIndex: currentScan, frame: arkitFrame)
+            lastSavedScan = (
+                index: currentScan, pose: arkitFrame.pose,
+                steady: motionOk)
 
             let t1 = ContinuousClock.now
             func ms(_ d: Duration) -> Int {
@@ -542,6 +590,10 @@ final class CaptureSessionManager: ObservableObject {
                 frameAgeMs: frameAgeMs,
                 trajectoryDeltaMs: trajDeltaMs
             )
+            addToCoverage(scanIndex: currentScan, frame: arkitFrame)
+            lastSavedScan = (
+                index: currentScan, pose: arkitFrame.pose,
+                steady: motionOk)
             // updateInsta360Captures edits pose.json, so it has to run
             // after saveScan writes the file. Called before, it found
             // no file and the shot's motion values were lost.
@@ -625,6 +677,17 @@ final class CaptureSessionManager: ObservableObject {
     private var insta360BackgroundTask: Task<Void, Never>?
 
     private static let autoCaptureCooldown: UInt64 = 2_500_000_000
+    /// Auto mode saves a scan without a 360 shot only this far from (or
+    /// turned this much from) the last saved scan, as LiDARFrameRecorder
+    /// saves its frames.
+    private static let newSpotMove: Float = 0.10
+    private static let newSpotTurnDeg: Float = 10
+    /// The last scan saved in this session: its number, pose, and
+    /// whether the phone was steady (turning under 2°/s) when it was
+    /// taken.
+    private var lastSavedScan: (
+        index: Int, pose: simd_float4x4, steady: Bool
+    )?
     private var isInsta360Busy = false
     /// True while captureScan() runs, so teardown can wait for it.
     private var scanInProgress = false
@@ -684,7 +747,7 @@ final class CaptureSessionManager: ObservableObject {
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "12k"
+    private static let buildTag = "12n"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }
@@ -708,6 +771,13 @@ final class CaptureSessionManager: ObservableObject {
 
         teardownStage = "2-stopARKit"
         arkitCapture.stop()
+        // No more ARKit frames: write the queued LiDAR frames.
+        arkitCapture.lidarFrameRecorder = nil
+        if let lidar = lidarFrameRecorder {
+            lidar.finish()
+            logMessage(lidar.summary())
+        }
+        lidarFrameRecorder = nil
 
         let dir = sessionDirectory
 
@@ -790,6 +860,24 @@ final class CaptureSessionManager: ObservableObject {
 
     func togglePointCloud() {
         showPointCloud.toggle()
+    }
+
+    func toggleCoverage() {
+        showCoverage.toggle()
+        if showCoverage {
+            logMessage(coverageMap.summary())
+        }
+    }
+
+    /// Queues a scan that saveScan has just written for the coverage view.
+    private func addToCoverage(scanIndex: Int, frame: ARKitFrameData) {
+        guard let dir = sessionDirectory else { return }
+        coverageMap.addScan(
+            directory: dir
+                .appendingPathComponent("raw/iphone")
+                .appendingPathComponent(
+                    String(format: "scan_%03d", scanIndex)),
+            frame: frame)
     }
 
     func dismissCalibCheck() {

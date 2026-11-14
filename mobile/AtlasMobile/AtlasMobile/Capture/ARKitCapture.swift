@@ -21,6 +21,8 @@ final class ARKitCapture: NSObject, ObservableObject {
 
     /// Injected by CaptureSessionManager so continuous poses feed the shared recorder.
     weak var trajectoryRecorder: TrajectoryRecorder?
+    /// Injected by CaptureSessionManager: saves LiDAR depth between photos.
+    weak var lidarFrameRecorder: LiDARFrameRecorder?
 
     private var lastDepthUpdate: TimeInterval = 0
     private var lastSpeedPose: simd_float4x4?
@@ -129,6 +131,7 @@ extension ARKitCapture: ARSessionDelegate {
             timestamp: frame.timestamp,
             pose: frame.camera.transform
         )
+        lidarFrameRecorder?.consider(frame)
 
         let dt = frame.timestamp - lastSpeedTimestamp
         if dt >= 0.2 {
