@@ -24,6 +24,8 @@ struct SessionExportView: View {
     /// How 360 photos are turned into tiles and fisheye views.
     @AppStorage(PanoramaLensModel.settingsKey)
     private var panoramaLensModel: PanoramaLensModel = .original
+    /// No 360 photo is left out of the COLMAP model for sharpness.
+    @AppStorage("ignore360Sharpness") private var ignore360Sharpness = false
     /// Last lines of this session's export trace when the app ended
     /// during its last export; nil otherwise.
     @State private var lastTrace: [String]?
@@ -68,6 +70,18 @@ struct SessionExportView: View {
                             }
                         }
                         Text(panoramaLensModel.detail)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Section("360 Photos") {
+                        Toggle("Keep 360 photos that fail the sharpness check",
+                               isOn: $ignore360Sharpness)
+                        Text("Keeps every 360 photo, whatever its own"
+                             + " sharpness score and also when its scan's"
+                             + " iPhone photo is too blurry. That iPhone"
+                             + " photo and its LiDAR points are still left"
+                             + " out. The photo time and motion checks still"
+                             + " apply.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -327,6 +341,9 @@ struct SessionExportView: View {
         let calibrateRig = UserDefaults.standard.bool(
             forKey: "onDeviceRigCalibration"
         )
+        let keepAll360 = UserDefaults.standard.bool(
+            forKey: "ignore360Sharpness"
+        )
         postProcessor.progress = ExportProgress(
             stage: calibrateRig
                 ? "Calibrating rig…" : "Checking ARKit tracking…",
@@ -340,7 +357,9 @@ struct SessionExportView: View {
             sessionDirectory: dir,
             "export started: \(modeStr), rig calibration "
                 + (calibrateRig ? "on" : "off")
-                + ", 360 lens model: \(lensModel.title)")
+                + ", 360 lens model: \(lensModel.title)"
+                + ", 360 sharpness check "
+                + (keepAll360 ? "off" : "on"))
         let pp = postProcessor
         /// Shows SDK stitching progress; called from the export's thread.
         let showStitching: @Sendable (Int, Int) -> Void = { done, total in
@@ -496,6 +515,7 @@ struct SessionExportView: View {
                     scans: scans,
                     cameraConfig: cfg,
                     cameraExportMode: mode,
+                    ignore360Sharpness: keepAll360,
                     onStage: { stage in
                         // Show the current step, so the screen says
                         // where the export was if it stops. The trace

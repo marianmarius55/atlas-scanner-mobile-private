@@ -332,11 +332,17 @@ final class COLMAPExporter {
 
     /// Writes cameras.bin, images.bin, points3D.bin, rigs.bin, and frames.bin.
     /// `onStage` receives a short description of each step, called on
-    /// the exporting thread.
+    /// the exporting thread. With `ignore360Sharpness`, no 360 photo is
+    /// left out for sharpness: neither for its own score nor because its
+    /// scan's iPhone photo is too blurry. That iPhone photo, its depth and
+    /// its LiDAR points are still left out; the 360 photo keeps its own
+    /// pose (from the trajectory) and frame. The photo time and motion
+    /// checks still apply.
     func export(
         scans uncheckedScans: [ScanExportData],
         cameraConfig: MultiCameraConfig,
         cameraExportMode: CameraExportMode = .pinholeTiles,
+        ignore360Sharpness: Bool = false,
         onStage: ((String) -> Void)? = nil
     ) throws {
         // Every export drops 360 photos of the wrong shot first.
@@ -410,26 +416,36 @@ final class COLMAPExporter {
 
         // A blurry iPhone frame drops the whole scan: the iPhone is
         // the rig reference. A low-scoring X5 shot drops only that
-        // shot and keeps the scan's iPhone frame.
+        // shot and keeps the scan's iPhone frame. With
+        // ignore360Sharpness, a scan whose iPhone frame is blurry keeps
+        // its X5 shots on their own, without the iPhone photo, depth or
+        // LiDAR points.
         var filteredScans: [ScanExportData] = []
         var skippedNames: [String] = []
         var droppedX5: [String] = []
+        var keptWithoutIphone: [String] = []
         for (i, scan) in scans.enumerated() {
+            var iphoneBlurry = false
             if let score = iphoneScores[i],
                score < Self.blurThreshold
             {
                 let tag = String(format: "%.1f", score)
                 skippedNames.append(
                     "\(scan.scanName) iphone(\(tag))")
-                continue
+                guard ignore360Sharpness,
+                      !scan.insta360ImageURLs.isEmpty
+                else { continue }
+                iphoneBlurry = true
             }
             var keptX5 = scan.insta360ImageURLs
-            for (camId, score) in x5Scores[i]
-            where score < x5Limit {
-                keptX5[camId] = nil
-                let tag = String(format: "%.1f", score)
-                droppedX5.append(
-                    "\(scan.scanName) x5-\(camId)(\(tag))")
+            if !ignore360Sharpness {
+                for (camId, score) in x5Scores[i]
+                where score < x5Limit {
+                    keptX5[camId] = nil
+                    let tag = String(format: "%.1f", score)
+                    droppedX5.append(
+                        "\(scan.scanName) x5-\(camId)(\(tag))")
+                }
             }
             for (camId, rate) in x5Rates[i]
             where rate > Self.x5MaxMeanDps && keptX5[camId] != nil {
@@ -438,7 +454,13 @@ final class COLMAPExporter {
                 droppedX5.append(
                     "\(scan.scanName) x5-\(camId)(\(tag))")
             }
-            if keptX5.count == scan.insta360ImageURLs.count {
+            if iphoneBlurry {
+                guard !keptX5.isEmpty else { continue }
+                keptWithoutIphone.append(scan.scanName)
+            }
+            if !iphoneBlurry
+                && keptX5.count == scan.insta360ImageURLs.count
+            {
                 filteredScans.append(scan)
             } else {
                 filteredScans.append(ScanExportData(
@@ -447,10 +469,12 @@ final class COLMAPExporter {
                     intrinsics: scan.intrinsics,
                     imageWidth: scan.imageWidth,
                     imageHeight: scan.imageHeight,
-                    depthBinURL: scan.depthBinURL,
-                    smoothedDepthBinURL:
-                        scan.smoothedDepthBinURL,
-                    iphoneImageURL: scan.iphoneImageURL,
+                    depthBinURL: iphoneBlurry
+                        ? nil : scan.depthBinURL,
+                    smoothedDepthBinURL: iphoneBlurry
+                        ? nil : scan.smoothedDepthBinURL,
+                    iphoneImageURL: iphoneBlurry
+                        ? nil : scan.iphoneImageURL,
                     insta360ImageURLs: keptX5,
                     insta360CommandTimestamp:
                         scan.insta360CommandTimestamp))
@@ -462,7 +486,14 @@ final class COLMAPExporter {
                 + " kept their iPhone frames: "
                 + droppedX5.joined(separator: ", "))
         }
-        if filteredScans.isEmpty {
+        if !keptWithoutIphone.isEmpty {
+            print(
+                "[Export] kept \(keptWithoutIphone.count) X5 shots"
+                + " without their blurry iPhone frames: "
+                + keptWithoutIphone.joined(separator: ", "))
+        }
+        // As before: if every iPhone frame is blurry, keep everything.
+        if !filteredScans.contains(where: { $0.iphoneImageURL != nil }) {
             print(
                 "[Export] all scans below blur"
                 + " threshold — keeping all"
@@ -478,6 +509,25 @@ final class COLMAPExporter {
                 + " blurry: \(names)"
             )
         }
+        let keptIphone = filteredScans.filter {
+            $0.iphoneImageURL != nil
+        }.count
+        let kept360 = filteredScans.reduce(0) {
+            $0 + $1.insta360ImageURLs.count
+        }
+        let all360 = scans.reduce(0) { $0 + $1.insta360ImageURLs.count }
+        var checkNote = "sharpness and motion checks: kept \(keptIphone)"
+            + " of \(scans.count) iPhone photos and \(kept360)"
+            + " of \(all360) 360 photos"
+        if ignore360Sharpness {
+            checkNote += "; 360 sharpness check off"
+            if !keptWithoutIphone.isEmpty {
+                checkNote += ", kept without their iPhone photo: "
+                    + keptWithoutIphone.joined(separator: ", ")
+            }
+        }
+        print("[Export] \(checkNote)")
+        ExportTrace.note(checkNote)
 
         let hasInsta360 = filteredScans.contains { !$0.insta360ImageURLs.isEmpty }
 
@@ -701,19 +751,24 @@ final class COLMAPExporter {
                 t_w2c_mat.columns.3.z
             )
 
-            // iPhone image entry — portrait rotation (saved JPEG is 90° CW)
-            let R_w2c_portrait = Self.portraitRotation * R_w2c_landscape
-            let t_w2c_portrait = Self.portraitRotation * t_w2c_landscape
+            // iPhone image entry — portrait rotation (saved JPEG is 90° CW).
+            // None for a scan kept only for its 360 photo (export's
+            // ignore360Sharpness); writeFramesBin then writes no iPhone
+            // frame for it either.
+            if scan.iphoneImageURL != nil {
+                let R_w2c_portrait = Self.portraitRotation * R_w2c_landscape
+                let t_w2c_portrait = Self.portraitRotation * t_w2c_landscape
 
-            entries.append(ImageEntry(
-                imageId: imageId,
-                quatWXYZ: Self.rotationToQuatWXYZ(R_w2c_portrait),
-                tvec: t_w2c_portrait,
-                cameraId: iphoneCameraId,
-                name: "face_iphone/\(scan.scanName).jpg",
-                observations: []
-            ))
-            imageId += 1
+                entries.append(ImageEntry(
+                    imageId: imageId,
+                    quatWXYZ: Self.rotationToQuatWXYZ(R_w2c_portrait),
+                    tvec: t_w2c_portrait,
+                    cameraId: iphoneCameraId,
+                    name: "face_iphone/\(scan.scanName).jpg",
+                    observations: []
+                ))
+                imageId += 1
+            }
 
             // Insta360 entries — only for scans that have ERP images
             if !scan.insta360ImageURLs.isEmpty {
@@ -1455,8 +1510,11 @@ final class COLMAPExporter {
                 + "/\(scans.count)"
                 + " \(scan.scanName)"
                 + " mem=\(mem)MB \(mode)")
-            onStage?("scan \(scanIdx + 1)/\(scans.count)"
-                + " iPhone (\(Self.memorySummary()))")
+            // A scan kept only for its 360 photo has no iPhone photo.
+            if scan.iphoneImageURL != nil {
+                onStage?("scan \(scanIdx + 1)/\(scans.count)"
+                    + " iPhone (\(Self.memorySummary()))")
+            }
 
             // Do not post didReceiveMemoryWarningNotification here.
             // NotificationCenter runs observers on the posting thread,
