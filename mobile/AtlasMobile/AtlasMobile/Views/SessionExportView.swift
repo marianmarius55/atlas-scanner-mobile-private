@@ -21,6 +21,9 @@ struct SessionExportView: View {
     /// default: exports ended the app at "Calibrating rig" and the
     /// cause is not confirmed (see export_trace.log).
     @AppStorage("onDeviceRigCalibration") private var onDeviceRigCalibration = false
+    /// How 360 photos are turned into tiles and fisheye views.
+    @AppStorage(PanoramaLensModel.settingsKey)
+    private var panoramaLensModel: PanoramaLensModel = .original
     /// Last lines of this session's export trace when the app ended
     /// during its last export; nil otherwise.
     @State private var lastTrace: [String]?
@@ -56,6 +59,19 @@ struct SessionExportView: View {
                     }
                 }
 
+                // How 360 photos become tiles and fisheye views
+                if selectedMode == .colmapOnly {
+                    Section("360 Lens Model") {
+                        Picker("Lens model", selection: $panoramaLensModel) {
+                            ForEach(PanoramaLensModel.allCases) { model in
+                                Text(model.title).tag(model)
+                            }
+                        }
+                        Text(panoramaLensModel.detail)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
 
                 // Host URL (only shown for host mode)
                 if selectedMode == .hostProcessing {
@@ -318,11 +334,24 @@ struct SessionExportView: View {
         )
         let modeStr = useMulti
             ? "nativeFisheye" : "pinholeTiles"
-        print("[Export] mode: \(modeStr)")
+        let lensModel = PanoramaLensModel.current
+        print("[Export] mode: \(modeStr), 360 lens: \(lensModel.title)")
         ExportTrace.begin(
             sessionDirectory: dir,
             "export started: \(modeStr), rig calibration "
-                + (calibrateRig ? "on" : "off"))
+                + (calibrateRig ? "on" : "off")
+                + ", 360 lens model: \(lensModel.title)")
+        let pp = postProcessor
+        /// Shows SDK stitching progress; called from the export's thread.
+        let showStitching: @Sendable (Int, Int) -> Void = { done, total in
+            Task { @MainActor in
+                guard !pp.progress.isComplete,
+                      pp.progress.error == nil
+                else { return }
+                pp.progress.stage = "Stitching 360 photos with the"
+                    + " Insta360 SDK: \(done)/\(total)"
+            }
+        }
         do {
             // Phase 1: rig calibration
             let (cal, check) = await Task.detached(
@@ -341,7 +370,7 @@ struct SessionExportView: View {
                 // COLMAP export (phase 2) runs the same check.
                 let timeCheck = COLMAPExporter.checkX5PhotoTimes(
                     scans: one.scans, sessionDirectory: dir)
-                let scans = timeCheck.scans
+                var scans = timeCheck.scans
                 let cfg = one.config
                 let traj = COLMAPExporter
                     .loadTrajectory(
@@ -356,6 +385,20 @@ struct SessionExportView: View {
                 ExportTrace.note(one.note)
                 print("[Export] \(timeCheck.note)")
                 ExportTrace.note(timeCheck.note)
+                // Rig calibration cuts its tiles from the SDK
+                // panoramas too; phase 2 reuses them.
+                if calibrateRig, lensModel == .sdkStitcher {
+                    let sdk = SDKPanoramaStitcher.prepare(
+                        scans: scans, config: cfg,
+                        sessionDirectory: dir,
+                        onProgress: showStitching)
+                    scans = sdk.scans
+                    print("[Export] \(sdk.note)")
+                    ExportTrace.note(sdk.note)
+                    Task { @MainActor in
+                        pp.progress.stage = "Calibrating rig…"
+                    }
+                }
                 let docs = fm.urls(
                     for: .documentDirectory,
                     in: .userDomainMask).first
@@ -398,7 +441,6 @@ struct SessionExportView: View {
                 stage: "Building COLMAP model…",
                 current: 0, total: 1)
             ExportTrace.note("building COLMAP model")
-            let pp = postProcessor
 
             try await Task.detached(
                 priority: .userInitiated
@@ -420,7 +462,20 @@ struct SessionExportView: View {
                         sessionDirectory: dir),
                     config: MultiCameraConfig
                         .loadFromDeviceOrBundle())
-                let scans = one.scans
+                var scans = one.scans
+                if lensModel == .sdkStitcher {
+                    // Only photos that pass the time check are
+                    // stitched; export() runs the check again.
+                    let checked = COLMAPExporter.checkX5PhotoTimes(
+                        scans: scans, sessionDirectory: dir)
+                    let sdk = SDKPanoramaStitcher.prepare(
+                        scans: checked.scans, config: one.config,
+                        sessionDirectory: dir,
+                        onProgress: showStitching)
+                    scans = sdk.scans
+                    print("[Export] \(sdk.note)")
+                    ExportTrace.note(sdk.note)
+                }
                 guard !scans.isEmpty else {
                     throw NSError(
                         domain: "Export",

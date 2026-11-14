@@ -1522,9 +1522,13 @@ final class COLMAPExporter {
                         ] as? Int
                     else { return nil }
 
+                    // A panorama from the SDK stitcher is 2:1 too;
+                    // its ImageDescription tells it apart.
                     let ratio = Float(imgW) / Float(imgH)
                     let isDual = ratio > 1.8
                         && ratio < 2.2
+                        && !DualFisheyeStitcher.isAppPanorama(
+                            properties: props)
 
                     var pixels: (px: [UInt8],
                                  w: Int, h: Int)?
@@ -1542,7 +1546,9 @@ final class COLMAPExporter {
                                 url: erpURL,
                                 outputWidth: erpW,
                                 rollDeg: roll,
-                                allowSubsample: useFisheye
+                                allowSubsample: useFisheye,
+                                lens: DualFisheyeStitcher
+                                    .lensCurve(forModel: model)
                             )
                     } else {
                         let img = autoreleasepool {
@@ -1584,8 +1590,11 @@ final class COLMAPExporter {
                         .model ?? ""
                     let roll = DualFisheyeStitcher
                         .rollCorrection(forModel: model)
+                    let lens = DualFisheyeStitcher
+                        .lensCurve(forModel: model)
 
-                    // Check if source is dual-fisheye
+                    // Check if source is dual-fisheye (an SDK
+                    // panorama is 2:1 too; see isAppPanorama)
                     let isDual: Bool = autoreleasepool {
                         guard let source =
                             CGImageSourceCreateWithURL(
@@ -1603,6 +1612,8 @@ final class COLMAPExporter {
                         else { return false }
                         let ratio = Float(w) / Float(h)
                         return ratio > 1.8 && ratio < 2.2
+                            && !DualFisheyeStitcher.isAppPanorama(
+                                properties: props)
                     }
 
                     if isDual {
@@ -1636,7 +1647,8 @@ final class COLMAPExporter {
                                             fisheyeRadiusFrac:
                                                 Self.fisheyeRadiusFrac,
                                             isFrontLens: isFront,
-                                            rollDeg: roll)
+                                            rollDeg: roll,
+                                            lens: lens)
                                 else { return }
 
                                 if let cp = colorProfile {
@@ -1751,6 +1763,9 @@ final class COLMAPExporter {
                             let ratio = Float(w) / Float(h)
                             let isDual = ratio > 1.8
                                 && ratio < 2.2
+                                && !DualFisheyeStitcher
+                                    .isAppPanorama(
+                                        properties: props)
                             return (isDual, w, h)
                         }
                     guard let info = srcInfo
@@ -1781,6 +1796,8 @@ final class COLMAPExporter {
                         let roll = DualFisheyeStitcher
                             .rollCorrection(
                                 forModel: model)
+                        let lens = DualFisheyeStitcher
+                            .lensCurve(forModel: model)
                         let faceRots =
                             ERPTileSlicer
                                 .computeFaceRotations()
@@ -1815,7 +1832,8 @@ final class COLMAPExporter {
                                                 faceRots[
                                                     faceIdx],
                                             tileFovDeg: fov,
-                                            rollDeg: roll)
+                                            rollDeg: roll,
+                                            lens: lens)
                                 {
                                     if let cp =
                                         colorProfile

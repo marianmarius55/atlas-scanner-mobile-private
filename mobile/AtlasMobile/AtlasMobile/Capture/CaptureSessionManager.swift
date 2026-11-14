@@ -684,7 +684,7 @@ final class CaptureSessionManager: ObservableObject {
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "12i"
+    private static let buildTag = "12j"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }
@@ -820,12 +820,14 @@ final class CaptureSessionManager: ObservableObject {
                     .connectedCamerasCopy().first?.model ?? ""
                 let roll = DualFisheyeStitcher
                     .rollCorrection(forModel: camModel)
+                let lens = DualFisheyeStitcher
+                    .lensCurve(forModel: camModel)
                 erpImage = await Task.detached(
                     priority: .userInitiated
                 ) {
                     DualFisheyeStitcher.stitch(
                         src, outputWidth: 2048,
-                        rollDeg: roll
+                        rollDeg: roll, lens: lens
                     )
                 }.value
             } else {

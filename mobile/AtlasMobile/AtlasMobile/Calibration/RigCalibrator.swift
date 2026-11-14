@@ -306,6 +306,7 @@ final class RigCalibrator {
         let calibX5 = x5Picks
         let rollDeg = DualFisheyeStitcher.rollCorrection(
             forModel: camCfg.model)
+        let lens = DualFisheyeStitcher.lensCurve(forModel: camCfg.model)
 
         // Tiles are cut at the feature resolution. The old bridge cut at
         // tileExtractSize and then downscaled to maxWidth; tileScale in
@@ -318,8 +319,12 @@ final class RigCalibrator {
             let scan = scans[si]
             guard let srcURL = scan.insta360ImageURLs
                 .values.first else { continue }
+            // With the SDK stitcher the image is a panorama in the app's
+            // 360 frame, not the raw dual-fisheye photo.
+            let isPanorama = DualFisheyeStitcher.isAppPanorama(url: srcURL)
             log("scan \(xi+1)/\(calibX5.count): loading"
-                + " \(scan.scanName) 360 image")
+                + " \(scan.scanName) 360 image"
+                + (isPanorama ? " (SDK panorama)" : ""))
 
             guard let src = autoreleasepool(invoking: {
                 DualFisheyeStitcher.loadPixels(
@@ -334,15 +339,22 @@ final class RigCalibrator {
 
             for fi in 0..<nFaces {
                 autoreleasepool {
-                    guard let tilePx = DualFisheyeStitcher
-                        .sliceTileFromDualFisheye(
+                    let cut = isPanorama
+                        ? DualFisheyeStitcher.sliceTileFromERP(
+                            srcPx: src.px,
+                            srcW: src.w, srcH: src.h,
+                            tileSize: tileSide,
+                            faceRotation: faceRots[fi],
+                            tileFovDeg: config.tileFovDeg)
+                        : DualFisheyeStitcher.sliceTileFromDualFisheye(
                             srcPx: src.px,
                             srcW: src.w, srcH: src.h,
                             tileSize: tileSide,
                             faceRotation: faceRots[fi],
                             tileFovDeg: config.tileFovDeg,
-                            rollDeg: rollDeg)
-                    else { return }
+                            rollDeg: rollDeg,
+                            lens: lens)
+                    guard let tilePx = cut else { return }
 
                     let id = nextId; nextId += 1
                     let n = features.addGray(

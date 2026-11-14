@@ -787,11 +787,14 @@ struct CalibrationView: View {
                         })?.model ?? ""
                 let roll = DualFisheyeStitcher
                     .rollCorrection(forModel: camModel)
+                let lens = DualFisheyeStitcher
+                    .lensCurve(forModel: camModel)
                 let stitched = await Task.detached(
                     priority: .userInitiated
                 ) {
                     DualFisheyeStitcher.stitch(
-                        src, outputWidth: 2048, rollDeg: roll
+                        src, outputWidth: 2048, rollDeg: roll,
+                        lens: lens
                     )
                 }.value
                 instaERP = stitched
