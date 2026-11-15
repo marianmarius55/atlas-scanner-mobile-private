@@ -52,8 +52,9 @@ struct SessionExportView: View {
                         }
                         .pickerStyle(.segmented)
                         Text(multiCameraExport
-                             ? "Insta360 exported as 2 equidistant fisheye lenses "
-                               + "(OPENCV_FISHEYE). Full FOV, requires 3DGUT."
+                             ? "Each 360 photo cut into its 2 lenses at full size, "
+                               + "as Spirula Studio does (THIN_PRISM_FISHEYE, the "
+                               + "X6's measured lenses). Full FOV."
                              : "Insta360 exported as 8 perspective tiles "
                                + "(SIMPLE_PINHOLE). Compatible with all pipelines.")
                             .font(.caption)
@@ -70,6 +71,12 @@ struct SessionExportView: View {
                             }
                         }
                         Text(panoramaLensModel.detail)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("X6 photos use the X6's measured lenses"
+                             + " (factory calibration and Spirula SfM)"
+                             + " instead. Fisheye export always cuts the raw"
+                             + " photos, without the SDK stitcher.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -405,8 +412,9 @@ struct SessionExportView: View {
                 print("[Export] \(timeCheck.note)")
                 ExportTrace.note(timeCheck.note)
                 // Rig calibration cuts its tiles from the SDK
-                // panoramas too; phase 2 reuses them.
-                if calibrateRig, lensModel == .sdkStitcher {
+                // panoramas too; phase 2 reuses them. Fisheye mode cuts
+                // the raw photos' lenses instead, as Spirula does.
+                if calibrateRig, lensModel == .sdkStitcher, !useMulti {
                     let sdk = SDKPanoramaStitcher.prepare(
                         scans: scans, config: cfg,
                         sessionDirectory: dir,
@@ -482,7 +490,7 @@ struct SessionExportView: View {
                     config: MultiCameraConfig
                         .loadFromDeviceOrBundle())
                 var scans = one.scans
-                if lensModel == .sdkStitcher {
+                if lensModel == .sdkStitcher, !useMulti {
                     // Only photos that pass the time check are
                     // stitched; export() runs the check again.
                     let checked = COLMAPExporter.checkX5PhotoTimes(

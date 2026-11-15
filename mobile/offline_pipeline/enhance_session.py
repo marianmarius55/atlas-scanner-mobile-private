@@ -6,8 +6,9 @@ the phone first). Then:
 1. Dense depth maps via PromptDA (LiDAR-anchored)
 2. Surface normal maps via StableNormal
 3. The COLMAP model: the app's export, kept as it is
-4. People masked out of the COLMAP images with SAM 3 (Spirula Studio), and
-   the LiDAR of iPhone photos with people removed (mask_people.py)
+4. People masked out of the COLMAP images with SAM 3 (Spirula Studio), the
+   area outside each 360 lens with Spirula's border mask, and the LiDAR of
+   iPhone photos with people removed (mask_people.py)
 
 Stages 1 and 2 are optional: when one fails, the others still run, and
 without PyTorch they are skipped.
@@ -230,7 +231,7 @@ def main() -> None:
     print("Stage 3: COLMAP model: using the app's export (colmap/sparse/0)")
 
     if not args.skip_people_mask:
-        print("Stage 4: masking people (SAM 3 via Spirula Studio)")
+        print("Stage 4: masking people and the 360 lens edges (Spirula Studio)")
         from mask_people import MaskingUnavailable, mask_session
         try:
             mask_session(session_dir, spirula=args.spirula, sam_model=args.sam_model)

@@ -268,8 +268,10 @@ struct ARCameraView: UIViewRepresentable {
                 top: target.levelY.max() ?? floorY,
                 color: targetColor.withAlphaComponent(0.5)))
             let next = target.nextLevel
+            // Only the current pass's height gets a globe.
             for (l, state) in target.states.enumerated()
-            where state == .todo || state == .failed {
+            where (state == .todo || state == .failed)
+                && (target.focusLevel == nil || l == target.focusLevel) {
                 let isNext = l == next
                 let globe = SCNNode(geometry: sphere(
                     radius: isNext ? 0.16 : 0.1,

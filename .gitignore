@@ -1,2 +1,10 @@
 mobile/AtlasMobile/Frameworks/
 *.zip
+
+mobile/offline_pipeline/models/
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+*.mlpackage/

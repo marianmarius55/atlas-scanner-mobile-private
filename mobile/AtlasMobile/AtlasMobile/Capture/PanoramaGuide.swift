@@ -24,9 +24,17 @@ struct PanoramaHint: Equatable {
 ///   where the phone has been;
 /// - a 360 shot sees a room cell when it's within 4 m and nothing nearer is
 ///   in the way (an equirect depth map of the map, as the photo would be);
-/// - a cell counts as covered once 2 spots see it; the next spot is the
-///   free place that would add most, nearer places first. A spot that's
-///   started is finished first.
+/// - the room is shot in three passes: first the high shot everywhere,
+///   then the chest shot at every spot of the high pass, then the low shot
+///   at those spots. A pass ends for good once it's done, so the guide
+///   doesn't go back to an earlier height;
+/// - the high pass places its spots by the route chosen in Camera
+///   Settings (Route): coverage, where a cell counts as covered once 2
+///   spots' high shots see it and the next spot is the nearest free place
+///   that adds at least half as much as the best one; or loops, along the
+///   walls and doorways first, then around the furniture and through the
+///   middle, the set spacing apart. In the chest and low passes the next
+///   spot is the nearest one still missing that height.
 ///
 /// Shots are grouped into spots by position and into levels by height
 /// above the floor. A shot is good when its photo arrived and the phone was
@@ -37,7 +45,77 @@ struct PanoramaHint: Equatable {
 /// shot. Tested in Python (pano_levels_sim.py) on sessions 2026-11-14 20:55
 /// and 21:58: 6-7 spots saw 85-90% of the reachable room from 2+ spots.
 final class PanoramaGuide: @unchecked Sendable {
+    // MARK: - Settings
+
+    /// How the high pass places its spots (Camera Settings, 360 Guide).
+    enum Route: String, CaseIterable, Identifiable {
+        /// Wherever the most of the room not yet seen twice is seen from.
+        case coverage
+        /// A loop along the walls, one around the furniture and through the
+        /// middle, and three spots at each doorway.
+        case loops
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .coverage: return "Coverage (original)"
+            case .loops: return "Loops: walls, furniture, doorways"
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .coverage:
+                return "Each next spot is the free place that sees the most of"
+                    + " the room not yet seen from 2 spots. Spacing: the least"
+                    + " distance between spots."
+            case .loops:
+                return "First a loop along the walls, about 0.65 m from them"
+                    + " (the middle of narrower floor), with 3 spots at each"
+                    + " doorway (before, in, after); then"
+                    + " a loop around the furniture and through the middle."
+                    + " Spacing: the distance between spots along a loop."
+            }
+        }
+
+        var defaultSpacing: Double { self == .coverage ? 0.6 : 1.0 }
+        var spacingKey: String { "panoramaGuideSpacing_\(rawValue)" }
+    }
+
+    static let routeKey = "panoramaGuideRoute"
+    static let spacingRange: ClosedRange<Double> = 0.4...2.0
+
+    struct Settings: Equatable {
+        let route: Route
+        /// Metres between spots.
+        let spacing: Float
+    }
+
+    /// The current settings; read from any thread.
+    static var settings: Settings {
+        let d = UserDefaults.standard
+        let route = d.string(forKey: routeKey)
+            .flatMap(Route.init(rawValue:)) ?? .coverage
+        let stored = d.object(forKey: route.spacingKey) as? Double
+        let spacing = min(max(stored ?? route.defaultSpacing,
+                              spacingRange.lowerBound),
+                          spacingRange.upperBound)
+        return Settings(route: route, spacing: Float(spacing))
+    }
+
     // MARK: - Tuning
+
+    /// Loops: distance from the walls (and anything tall) of the wall loop.
+    static let wallBand: ClosedRange<Float> = 0.5...0.8
+    /// Loops: distance from the furniture of the furniture loop.
+    static let furnitureBand: ClosedRange<Float> = 0.4...0.8
+    /// Loops: an obstacle with LiDAR cells at these heights above the
+    /// floor is a wall (or a wardrobe); lower ones are furniture. It stops
+    /// below the ceiling, which is over every column of the room.
+    static let wallHeights: ClosedRange<Float> = 1.7...2.1
+    /// Loops: the spots before and after a doorway are this far from it.
+    static let doorwayStep: Float = 0.7
 
     /// The map's 5 cm cells are merged into planning cells of this size.
     static let planCell: Float = 0.10
@@ -68,10 +146,6 @@ final class PanoramaGuide: @unchecked Sendable {
     static let standTop: Float = 1.6
     /// Shots this close (horizontally) to a spot's centre belong to it.
     static let spotRadius: Float = 0.4
-    /// A new spot this far from spots that have a good shot.
-    static let spotSpacing: Float = 0.6
-    /// An unfinished spot this close to the phone is finished first.
-    static let finishRadius: Float = 1.0
     /// The phone this close (horizontally) to the target is there.
     static let arriveRadius: Float = 0.3
     /// Heights above the floor of the high, chest and low shot until the
@@ -111,14 +185,20 @@ final class PanoramaGuide: @unchecked Sendable {
         /// World height of the high, chest and low shot.
         let levelY: [Float]
         let states: [LevelState]
+        /// The target's level in the current pass; nil for spots.
+        var focusLevel: Int? = nil
 
         var isComplete: Bool {
             !states.contains(where: { $0 == .todo || $0 == .failed })
         }
 
-        /// The next level to shoot: high, then chest, then low.
+        /// The level to shoot here: the pass's for the target, else high,
+        /// then chest, then low.
         var nextLevel: Int? {
-            states.firstIndex(where: { $0 == .todo || $0 == .failed })
+            if let l = focusLevel {
+                return states[l] == .todo || states[l] == .failed ? l : nil
+            }
+            return states.firstIndex(where: { $0 == .todo || $0 == .failed })
         }
     }
 
@@ -137,8 +217,18 @@ final class PanoramaGuide: @unchecked Sendable {
         let pending: SIMD3<Float>?
         let shotCount: Int
         let movedCount: Int
-        /// Share of the cells free places can see that 2+ spots see.
+        /// The pass: 0 high, 1 chest, 2 low, 3 all done.
+        let pass: Int
+        /// How the high pass places its spots.
+        let route: Route
+        /// High pass with the coverage route: share of the cells free
+        /// places can see that 2+ spots' high shots see. Otherwise: share
+        /// of the spots done.
         let coveredFraction: Float
+        /// Spots done at the pass's height, and in all (the coverage
+        /// route's high pass: unused).
+        let passDone: Int
+        let passTotal: Int
         /// The planning cells as dots: dotCount x 3 Float32 positions and
         /// colours, and dotCount UInt32 indices.
         let dotCount: Int
@@ -150,8 +240,9 @@ final class PanoramaGuide: @unchecked Sendable {
             Snapshot(
                 version: version, dotsVersion: version, status: .needMap,
                 floorY: nil, spots: [], target: nil, targetIsNew: false,
-                pending: nil, shotCount: 0, movedCount: 0,
-                coveredFraction: 0, dotCount: 0,
+                pending: nil, shotCount: 0, movedCount: 0, pass: 0,
+                route: .coverage, coveredFraction: 0, passDone: 0,
+                passTotal: 0, dotCount: 0,
                 positions: Data(), colors: Data(), indices: Data())
         }
     }
@@ -179,6 +270,9 @@ final class PanoramaGuide: @unchecked Sendable {
         let levelY: [Float]
         let blocked: [Bool]
         var gain: Float
+        /// Loops: 0 the wall loop and doorways, 1 the furniture loop and
+        /// the middle, shot after stage 0. Coverage: always 0.
+        var stage: Int = 0
     }
 
     /// A plan from one state of the map and the shots.
@@ -190,7 +284,13 @@ final class PanoramaGuide: @unchecked Sendable {
         let candidates: [Candidate]
         let shotCount: Int
         let movedCount: Int
+        let pass: Int
+        let route: Route
+        /// This pass has nothing left to do.
+        let finished: Bool
         let coveredFraction: Float
+        let passDone: Int
+        let passTotal: Int
         let dotCount: Int
         let positions: Data
         let colors: Data
@@ -213,6 +313,9 @@ final class PanoramaGuide: @unchecked Sendable {
     private var plannedShotsVersion = -1
     private var plannedAt: TimeInterval = 0
     private var previousTarget: SIMD2<Float>?
+    /// The pass reached: 0 high, 1 chest, 2 low, 3 all done. Only goes up.
+    private var pass = 0
+    private var plannedSettings: Settings?
     private var publishedPlanID = -1
     private var publishedTarget: SpotMarker?
     private var publishedTargetIsNew = false
@@ -246,6 +349,8 @@ final class PanoramaGuide: @unchecked Sendable {
             plannedShotsVersion = -1
             plannedAt = 0
             previousTarget = nil
+            pass = 0
+            plannedSettings = nil
             publishedPlanID = -1
             publishedTarget = nil
             publishedTargetIsNew = false
@@ -310,15 +415,18 @@ final class PanoramaGuide: @unchecked Sendable {
     static func hint(
         for s: Snapshot, phone: simd_float4x4?
     ) -> PanoramaHint {
-        let complete = s.spots.filter(\.isComplete).count
-        var detail = "Spots: \(s.spots.count) (\(complete) complete)"
-            + " · 360 shots: \(s.shotCount)"
+        var detail = s.pass < 3
+            ? "\(levelNames[s.pass].capitalized) pass (\(s.pass + 1)/3)"
+            : "All 3 passes done"
+        detail += " · 360 shots: \(s.shotCount)"
         if s.movedCount > 0 {
             detail += ", \(s.movedCount) moved"
         }
-        if s.status != .needMap {
+        if s.status != .needMap && s.pass == 0 && s.route == .coverage {
             let pct = Int((s.coveredFraction * 100).rounded())
             detail += " · \(pct)% seen from 2+ spots"
+        } else if s.status != .needMap && s.pass < 3 {
+            detail += " · \(s.passDone)/\(s.passTotal) spots done"
         }
         func say(_ text: String, arrow: Double? = nil) -> PanoramaHint {
             PanoramaHint(
@@ -353,7 +461,9 @@ final class PanoramaGuide: @unchecked Sendable {
             ) * 180 / Double.pi
             while deg > 180 { deg -= 360 }
             while deg <= -180 { deg += 360 }
-            let what = s.targetIsNew ? "Next spot" : "Finish this spot"
+            let what = target.focusLevel.map {
+                "Nearest \(levelNames[$0]) shot"
+            } ?? "Next spot"
             return say(
                 String(format: "%@: %.1f m", what, Double(distance)),
                 arrow: deg)
@@ -397,12 +507,25 @@ final class PanoramaGuide: @unchecked Sendable {
         let cellsChanged = cov.version != plannedCoverageVersion
         let grew = abs(cov.count - plannedCellCount)
             >= max(300, plannedCellCount / 20)
+        let settings = Self.settings
         if plan == nil || shotsVersion != plannedShotsVersion
+            || settings != plannedSettings
             || (cellsChanged && (grew || now - plannedAt > 8))
         {
-            plan = makePlan(
-                cov, shots: shots,
-                trajectory: trajectory?.positions(every: 10) ?? [])
+            let path = trajectory?.positions(every: 10) ?? []
+            var made = makePlan(
+                cov, shots: shots, trajectory: path, pass: pass,
+                settings: settings)
+            // A finished pass moves on to the next height for good.
+            while made.finished && pass < 3 {
+                pass += 1
+                previousTarget = nil
+                made = makePlan(
+                    cov, shots: shots, trajectory: path, pass: pass,
+                    settings: settings)
+            }
+            plan = made
+            plannedSettings = settings
             plannedCoverageVersion = cov.version
             plannedCellCount = cov.count
             plannedShotsVersion = shotsVersion
@@ -441,76 +564,98 @@ final class PanoramaGuide: @unchecked Sendable {
             status: plan.status, floorY: plan.floorY, spots: plan.spots,
             target: target, targetIsNew: isNew, pending: pending,
             shotCount: plan.shotCount, movedCount: plan.movedCount,
+            pass: plan.pass, route: plan.route,
             coveredFraction: plan.coveredFraction,
+            passDone: plan.passDone, passTotal: plan.passTotal,
             dotCount: plan.dotCount, positions: plan.positions,
             colors: plan.colors, indices: plan.indices)
     }
 
-    /// An unfinished spot near the phone, else the best new spot: most
-    /// gain, nearer first. The spot already shown stays unless another
-    /// scores 25% better, so the target doesn't jump while walking.
+    /// The globe nearest the phone that still needs this pass's height.
+    /// High pass: a spot whose high shot is missing or failed, or a free
+    /// place adding at least half as much as the best one (loops: a place
+    /// of the route, the wall loop's first). Chest and low
+    /// pass: a spot of the high pass missing that height. The globe shown
+    /// stays unless another is 0.5 m nearer, so it doesn't jump while
+    /// walking.
     private func chooseTarget(
         _ plan: Plan, phone: SIMD2<Float>?
     ) -> (SpotMarker?, Bool) {
-        if let phone {
-            var nearest: SpotMarker?
-            var nearestDistance = Self.finishRadius
-            for spot in plan.spots where !spot.isComplete {
-                let d = simd_distance(spot.center, phone)
-                if d <= nearestDistance {
-                    nearest = spot
-                    nearestDistance = d
-                }
-            }
-            if let nearest {
-                previousTarget = nil
-                return (nearest, false)
-            }
-        }
-        guard plan.status == .planning, !plan.candidates.isEmpty else {
+        let l = plan.pass
+        guard plan.status == .planning, l < 3 else {
             previousTarget = nil
             return (nil, false)
         }
-        func score(_ c: Candidate) -> Float {
-            let d = phone.map { simd_distance(c.center, $0) } ?? 0
-            return c.gain / (1 + 0.25 * d)
+        var options: [(marker: SpotMarker, isNew: Bool, gain: Float)] = []
+        for spot in plan.spots {
+            let s = spot.states[l]
+            guard s == .todo || s == .failed else { continue }
+            if l > 0 && spot.states[0] != .done { continue }
+            var marker = spot
+            marker.focusLevel = l
+            options.append((marker, false, .infinity))
         }
-        var best = plan.candidates[0]
-        for c in plan.candidates.dropFirst() where score(c) > score(best) {
-            best = c
+        if l == 0 {
+            // Loops: the wall loop and doorways before the furniture loop.
+            let stage = plan.candidates.map(\.stage).min() ?? 0
+            let best = plan.candidates.map(\.gain).max() ?? 0
+            for c in plan.candidates
+            where c.stage == stage && !c.blocked[0]
+                && c.gain >= 0.5 * best {
+                let states = c.blocked.map {
+                    $0 ? LevelState.blocked : LevelState.todo
+                }
+                options.append((
+                    SpotMarker(center: c.center, levelY: c.levelY,
+                               states: states, focusLevel: 0),
+                    true, c.gain))
+            }
         }
+        guard !options.isEmpty else {
+            previousTarget = nil
+            return (nil, false)
+        }
+        guard let phone else {
+            // No pose yet: the spot needing it, else the most gain.
+            let pick = options.max { $0.gain < $1.gain }!
+            previousTarget = pick.marker.center
+            return (pick.marker, pick.isNew)
+        }
+        func distance(_ o: (marker: SpotMarker, isNew: Bool, gain: Float))
+            -> Float {
+            simd_distance(o.marker.center, phone)
+        }
+        var pick = options.min { distance($0) < distance($1) }!
         if let previous = previousTarget,
-           let kept = plan.candidates.first(where: {
-               simd_distance($0.center, previous) < 0.2
+           let kept = options.first(where: {
+               simd_distance($0.marker.center, previous) < 0.2
            }),
-           score(kept) >= 0.8 * score(best)
+           distance(kept) <= distance(pick) + 0.5
         {
-            best = kept
+            pick = kept
         }
-        previousTarget = best.center
-        let states = best.blocked.map {
-            $0 ? LevelState.blocked : LevelState.todo
-        }
-        return (
-            SpotMarker(
-                center: best.center, levelY: best.levelY, states: states),
-            true)
+        previousTarget = pick.marker.center
+        return (pick.marker, pick.isNew)
     }
 
     /// Floor, spots, what the spots see, and the free places to try next
     /// with their gain. Port of pano_levels_sim.py.
     private func makePlan(
         _ cov: CoverageMap.Snapshot, shots: [Shot],
-        trajectory: [SIMD3<Float>]
+        trajectory: [SIMD3<Float>], pass: Int, settings: Settings
     ) -> Plan {
         planCounter += 1
         let id = planCounter
         let moved = shots.filter { !$0.good }.count
+        // The height whose shots count: the pass's, the low one when done.
+        let passLevel = min(pass, 2)
         func bare(_ status: Status, floorY: Float? = nil) -> Plan {
             Plan(
                 id: id, status: status, floorY: floorY, spots: [],
                 candidates: [], shotCount: shots.count, movedCount: moved,
-                coveredFraction: 0, dotCount: 0, positions: Data(),
+                pass: pass, route: settings.route, finished: false,
+                coveredFraction: 0,
+                passDone: 0, passTotal: 0, dotCount: 0, positions: Data(),
                 colors: Data(), indices: Data())
         }
 
@@ -622,7 +767,11 @@ final class PanoramaGuide: @unchecked Sendable {
         var reach = [Bool](repeating: false, count: nc)
         var seen = [Bool](repeating: false, count: nc)
         for group in groups {
-            let good = group.members.filter(\.good)
+            // Only this pass's height: the dots show what it has covered.
+            let good = group.members.filter {
+                $0.good && Self.level(forHeight: $0.position.y - floorY)
+                    == passLevel
+            }
             guard !good.isEmpty else { continue }
             for i in 0..<nc { seen[i] = false }
             for s in good {
@@ -659,6 +808,8 @@ final class PanoramaGuide: @unchecked Sendable {
         }
         var floorColumn = [Bool](repeating: false, count: nx * nz)
         var blockedColumn = [Bool](repeating: false, count: nx * nz)
+        // Something at wallHeights: a wall or a wardrobe, not furniture.
+        var tallColumn = [Bool](repeating: false, count: nx * nz)
         for p in cells5 {
             let (i, j) = column(p.x, p.z)
             guard i >= 0, i < nx, j >= 0, j < nz else { continue }
@@ -668,6 +819,9 @@ final class PanoramaGuide: @unchecked Sendable {
             }
             if h > Self.floorNoiseTop && h < Self.standTop {
                 blockedColumn[i * nz + j] = true
+            }
+            if Self.wallHeights.contains(h) {
+                tallColumn[i * nz + j] = true
             }
         }
         func standable(_ i: Int, _ j: Int) -> Bool {
@@ -717,12 +871,13 @@ final class PanoramaGuide: @unchecked Sendable {
             Self.lattice,
             (Float(reachableCount) * gs * gs / Self.maxCandidates)
                 .squareRoot())
-        let shotCenters = spots
-            .filter { $0.states.contains(.done) }
-            .map(\.center)
+        // Only the high pass places new spots; chest and low go back to
+        // its spots.
+        let shotCenters = spots.map(\.center)
         var candidates: [Candidate] = []
         var x = x0 + 0.5
-        while x < x0 + Float(nx) * gs - 0.5 {
+        while pass == 0, settings.route == .coverage,
+              x < x0 + Float(nx) * gs - 0.5 {
             var z = z0 + 0.5
             while z < z0 + Float(nz) * gs - 0.5 {
                 defer { z += step }
@@ -741,11 +896,11 @@ final class PanoramaGuide: @unchecked Sendable {
                 guard onFloor else { continue }
                 let xz = SIMD2<Float>(x, z)
                 guard !shotCenters.contains(where: {
-                    simd_distance($0, xz) < Self.spotSpacing
+                    simd_distance($0, xz) < settings.spacing
                 }) else { continue }
                 guard Self.isClear(
-                    SIMD3<Float>(x, levelY[1], z),
-                    ignoreBelow: ignoreBelow(1), occupied: occupied)
+                    SIMD3<Float>(x, levelY[0], z),
+                    ignoreBelow: ignoreBelow(0), occupied: occupied)
                 else { continue }
                 let blocked = (0..<3).map { l in
                     !Self.isClear(
@@ -758,14 +913,51 @@ final class PanoramaGuide: @unchecked Sendable {
             x += step
         }
 
+        // Loops: the route's places, around the spots shot already.
+        if pass == 0 && settings.route == .loops {
+            // Furniture: something in the way that isn't tall. Walls:
+            // anything else one can't stand on (tall things, and past
+            // the mapped floor).
+            var furniture = [Bool](repeating: false, count: nx * nz)
+            var wall = [Bool](repeating: false, count: nx * nz)
+            for k in 0..<(nx * nz) {
+                furniture[k] = blockedColumn[k] && !tallColumn[k]
+                wall[k] = !reachable[k] && !furniture[k]
+            }
+            let start = trajectory.first.map { SIMD2<Float>($0.x, $0.z) }
+            candidates = Self.loopCandidates(
+                LoopGrid(nx: nx, nz: nz, x0: x0, z0: z0, gs: gs,
+                         reachable: reachable, wall: wall,
+                         furniture: furniture),
+                spacing: settings.spacing, start: start,
+                taken: shotCenters
+            ) { xz in
+                // A place is usable when the high shot is clear there.
+                guard Self.isClear(
+                    SIMD3<Float>(xz.x, levelY[0], xz.y),
+                    ignoreBelow: ignoreBelow(0), occupied: occupied)
+                else { return nil }
+                return (0..<3).map { l in
+                    !Self.isClear(
+                        SIMD3<Float>(xz.x, levelY[l], xz.y),
+                        ignoreBelow: ignoreBelow(l), occupied: occupied)
+                }
+            }.map {
+                Candidate(center: $0.center, levelY: levelY,
+                          blocked: $0.blocked, gain: 1, stage: $0.stage)
+            }
+        }
+
         // Gain of each place: the cells its shots would see, more for
-        // cells no spot sees yet, less for far ones.
+        // cells no spot sees yet, less for far ones. The loops route
+        // places by the route alone.
         var minDistance = [Float](repeating: .infinity, count: nc)
         let fullW = Self.fullWeightDistance
         let fallSpan = Self.maxView - Self.fullWeightDistance
-        for c in candidates.indices {
+        for c in candidates.indices where settings.route == .coverage {
             for i in 0..<nc { minDistance[i] = .infinity }
-            for l in 0..<3 where !candidates[c].blocked[l] {
+            // The high pass: what the high shot would see.
+            for l in 0..<1 where !candidates[c].blocked[l] {
                 let eye = SIMD3<Float>(
                     candidates[c].center.x, candidates[c].levelY[l],
                     candidates[c].center.y)
@@ -789,6 +981,10 @@ final class PanoramaGuide: @unchecked Sendable {
             candidates[c].gain = gain
         }
 
+        if settings.route == .loops {
+            // No visibility per place: a cell no spot sees yet shows red.
+            for i in 0..<nc { reach[i] = true }
+        }
         var reachCount = 0
         var twice = 0
         for i in 0..<nc where reach[i] {
@@ -796,15 +992,41 @@ final class PanoramaGuide: @unchecked Sendable {
             if spotCount[i] >= 2 { twice += 1 }
         }
         let bestGain = candidates.map(\.gain).max() ?? 0
+        // Chest and low pass: the high pass's spots and how many have
+        // this height. Loops' high pass: those shot and the route's rest.
+        let passSpots = spots.filter {
+            $0.states[0] == .done && $0.states[passLevel] != .blocked
+        }
+        let passDone = passSpots.filter {
+            $0.states[passLevel] == .done
+        }.count
+        let passTotal = pass == 0 && settings.route == .loops
+            ? passSpots.count + candidates.count : passSpots.count
         let status: Status
-        if candidates.isEmpty && spots.isEmpty {
-            status = .needMap
-        } else if candidates.isEmpty
-            || bestGain < max(15, 0.02 * Float(reachCount))
-        {
+        let finished: Bool
+        if pass >= 3 {
             status = .covered
+            finished = false
+        } else if pass == 0 {
+            let missing = spots.contains {
+                $0.states[0] == .failed
+            }
+            if candidates.isEmpty && spots.isEmpty {
+                status = .needMap
+                finished = false
+            } else if !missing && (candidates.isEmpty
+                || (settings.route == .coverage
+                    && bestGain < max(15, 0.02 * Float(reachCount))))
+            {
+                status = .covered
+                finished = spots.contains { $0.states[0] == .done }
+            } else {
+                status = .planning
+                finished = false
+            }
         } else {
-            status = .planning
+            finished = passDone == passSpots.count
+            status = finished ? .covered : .planning
         }
 
         // The planning cells as dots.
@@ -836,12 +1058,277 @@ final class PanoramaGuide: @unchecked Sendable {
             id: id, status: status, floorY: floorY, spots: spots,
             candidates: candidates.filter { $0.gain > 0 },
             shotCount: shots.count, movedCount: moved,
-            coveredFraction: reachCount > 0
-                ? Float(twice) / Float(reachCount) : 0,
+            pass: pass, route: settings.route, finished: finished,
+            coveredFraction: pass == 0 && settings.route == .coverage
+                ? (reachCount > 0 ? Float(twice) / Float(reachCount) : 0)
+                : (passTotal == 0
+                    ? 1 : Float(passDone) / Float(passTotal)),
+            passDone: passDone, passTotal: passTotal,
             dotCount: nc,
             positions: positions.withUnsafeBufferPointer { Data(buffer: $0) },
             colors: colors.withUnsafeBufferPointer { Data(buffer: $0) },
             indices: indices.withUnsafeBufferPointer { Data(buffer: $0) })
+    }
+
+    // MARK: - Loops route
+
+    /// The floor plan the loops route is laid out on: planCell columns,
+    /// column (i, j) at k = i * nz + j, its centre at x0 + (i + 0.5) gs,
+    /// z0 + (j + 0.5) gs.
+    private struct LoopGrid {
+        let nx: Int, nz: Int
+        let x0: Float, z0: Float, gs: Float
+        /// Floor one can walk on, joined to where the phone has been.
+        let reachable: [Bool]
+        /// Walls, tall things and everything past the mapped floor.
+        let wall: [Bool]
+        /// Low things in the way: beds, tables, desks.
+        let furniture: [Bool]
+
+        func centre(_ k: Int) -> SIMD2<Float> {
+            SIMD2(x0 + (Float(k / nz) + 0.5) * gs,
+                  z0 + (Float(k % nz) + 0.5) * gs)
+        }
+
+        func index(_ p: SIMD2<Float>) -> Int? {
+            let i = Int(((p.x - x0) / gs).rounded(.down))
+            let j = Int(((p.y - z0) / gs).rounded(.down))
+            guard i >= 0, i < nx, j >= 0, j < nz else { return nil }
+            return i * nz + j
+        }
+    }
+
+    /// The loops route's places that no spot is near yet: the doorways'
+    /// and the wall loop's (stage 0), then the furniture loop's and the
+    /// middle's (stage 1), `spacing` apart along each loop. `usable` says
+    /// whether the high shot is clear at a place (nil when not) and which
+    /// levels are blocked there.
+    private static func loopCandidates(
+        _ g: LoopGrid, spacing s: Float, start: SIMD2<Float>?,
+        taken existing: [SIMD2<Float>],
+        usable: (SIMD2<Float>) -> [Bool]?
+    ) -> [(center: SIMD2<Float>, blocked: [Bool], stage: Int)] {
+        let n = g.nx * g.nz
+        guard n > 0 else { return [] }
+        let toWall = distanceField(g.wall, g)
+        let toFurniture = distanceField(g.furniture, g)
+        var out: [(center: SIMD2<Float>, blocked: [Bool], stage: Int)] = []
+        var taken = existing
+
+        // Doorways: three spots each, before, in and after.
+        let doorKeep = min(0.7 * s, 0.5)
+        for door in doorways(g, toWall: toWall) {
+            for t: Float in [-1, 0, 1] {
+                let p = door.centre + t * doorwayStep * door.axis
+                guard let k = g.index(p), g.reachable[k],
+                      !taken.contains(where: {
+                          simd_distance($0, p) < doorKeep
+                      }),
+                      let blocked = usable(p)
+                else { continue }
+                taken.append(p)
+                out.append((p, blocked, 0))
+            }
+        }
+
+        // The wall loop: the floor within wallBand's far edge of the walls,
+        // best near the band's middle (in a strip narrower than the band,
+        // the strip's middle). Then the furniture loop, then the middle.
+        // Each place's cost is how far it is from where the loop wants it.
+        typealias Band = (points: [SIMD2<Float>], cost: [Float])
+        var wallBand: Band = ([], [])
+        var furnitureBand: Band = ([], [])
+        var middle: Band = ([], [])
+        let wallMid = (Self.wallBand.lowerBound + Self.wallBand.upperBound) / 2
+        let furnitureMid = (Self.furnitureBand.lowerBound
+            + Self.furnitureBand.upperBound) / 2
+        for k in 0..<n where g.reachable[k] {
+            let w = toWall[k], f = toFurniture[k]
+            // Between a wall and furniture closer than twice the band's
+            // middle, the floor's middle: w + f is the floor's width there.
+            if w <= Self.wallBand.upperBound {
+                wallBand.points.append(g.centre(k))
+                wallBand.cost.append(abs(w - min(wallMid, (w + f) / 2)))
+            } else if f <= Self.furnitureBand.upperBound {
+                furnitureBand.points.append(g.centre(k))
+                furnitureBand.cost.append(
+                    abs(f - min(furnitureMid, (w + f) / 2)))
+            } else {
+                middle.points.append(g.centre(k))
+                middle.cost.append(0)
+            }
+        }
+        var cursor = start
+        for (band, stage) in [(wallBand, 0), (furnitureBand, 1),
+                              (middle, 1)] {
+            let placed = walk(band.points, cost: band.cost, spacing: s,
+                              from: cursor, taken: &taken, usable: usable)
+            for p in placed {
+                out.append((p.center, p.blocked, stage))
+            }
+            if let last = placed.last { cursor = last.center }
+        }
+        return out
+    }
+
+    /// Distance in metres from each column to the nearest `source` column
+    /// (chamfer, 2 passes); .infinity without any.
+    private static func distanceField(
+        _ source: [Bool], _ g: LoopGrid
+    ) -> [Float] {
+        let nx = g.nx, nz = g.nz
+        let a = g.gs, b = g.gs * Float(2).squareRoot()
+        var d = [Float](repeating: .infinity, count: nx * nz)
+        for k in 0..<(nx * nz) where source[k] { d[k] = 0 }
+        for i in 0..<nx {
+            for j in 0..<nz {
+                let k = i * nz + j
+                var v = d[k]
+                if i > 0 {
+                    v = min(v, d[k - nz] + a)
+                    if j > 0 { v = min(v, d[k - nz - 1] + b) }
+                    if j + 1 < nz { v = min(v, d[k - nz + 1] + b) }
+                }
+                if j > 0 { v = min(v, d[k - 1] + a) }
+                d[k] = v
+            }
+        }
+        for i in stride(from: nx - 1, through: 0, by: -1) {
+            for j in stride(from: nz - 1, through: 0, by: -1) {
+                let k = i * nz + j
+                var v = d[k]
+                if i + 1 < nx {
+                    v = min(v, d[k + nz] + a)
+                    if j + 1 < nz { v = min(v, d[k + nz + 1] + b) }
+                    if j > 0 { v = min(v, d[k + nz - 1] + b) }
+                }
+                if j + 1 < nz { v = min(v, d[k + 1] + a) }
+                d[k] = v
+            }
+        }
+        return d
+    }
+
+    /// Doorways: places where the floor narrows between walls to at most
+    /// 1.2 m (walls within 0.8 m on both sides) with open floor 1 m away
+    /// on both sides along the passage. Each is the column furthest from
+    /// the walls, with the passage's direction.
+    private static func doorways(
+        _ g: LoopGrid, toWall: [Float]
+    ) -> [(centre: SIMD2<Float>, axis: SIMD2<Float>)] {
+        let dirs: [SIMD2<Float>] = [
+            SIMD2(1, 0), SIMD2(0, 1),
+            simd_normalize(SIMD2(1, 1)), simd_normalize(SIMD2(1, -1)),
+        ]
+        func wallWithin(_ p: SIMD2<Float>, _ dir: SIMD2<Float>,
+                        _ reach: Float) -> Bool {
+            var t: Float = g.gs
+            while t <= reach {
+                guard let k = g.index(p + t * dir) else { return true }
+                if g.wall[k] { return true }
+                t += g.gs * 0.5
+            }
+            return false
+        }
+        func open(_ p: SIMD2<Float>) -> Bool {
+            guard let k = g.index(p) else { return false }
+            return g.reachable[k] && toWall[k] >= 0.7
+        }
+        var found: [(centre: SIMD2<Float>, axis: SIMD2<Float>, w: Float)] = []
+        for k in 0..<(g.nx * g.nz) where g.reachable[k] {
+            let w = toWall[k]
+            guard w >= 0.25, w <= 0.6 else { continue }
+            let p = g.centre(k)
+            for n in dirs {
+                guard wallWithin(p, n, 0.8), wallWithin(p, -n, 0.8)
+                else { continue }
+                let axis = SIMD2<Float>(-n.y, n.x)
+                guard open(p + axis), open(p - axis) else { continue }
+                found.append((p, axis, w))
+                break
+            }
+        }
+        // One per doorway: the widest place, others within 0.8 m dropped.
+        found.sort { $0.w > $1.w }
+        var doors: [(centre: SIMD2<Float>, axis: SIMD2<Float>)] = []
+        for f in found where !doors.contains(where: {
+            simd_distance($0.centre, f.centre) < 0.8
+        }) {
+            doors.append((f.centre, f.axis))
+        }
+        return doors
+    }
+
+    /// Places along `band` (column centres), `s` apart: from the band's
+    /// place nearest `start`, each next place 0.75-1.3 s on, the
+    /// straightest way ahead at the lowest `cost` (metres off where the
+    /// loop wants to be), until the band runs out; then again from the
+    /// nearest place left, for the band's other pieces. A place within
+    /// 0.7 s of `taken` (spots, places already picked) isn't used.
+    private static func walk(
+        _ band: [SIMD2<Float>], cost: [Float], spacing s: Float,
+        from start: SIMD2<Float>?,
+        taken: inout [SIMD2<Float>],
+        usable: (SIMD2<Float>) -> [Bool]?
+    ) -> [(center: SIMD2<Float>, blocked: [Bool])] {
+        var out: [(center: SIMD2<Float>, blocked: [Bool])] = []
+        let keep = 0.7 * s
+        var rejected = Set<Int>()
+        func free(_ i: Int) -> Bool {
+            !rejected.contains(i)
+                && !taken.contains { simd_distance($0, band[i]) < keep }
+        }
+        /// The first of `order` that is usable; the others tried are
+        /// rejected for good.
+        func pick(_ order: [Int]) -> (Int, [Bool])? {
+            for i in order.prefix(12) {
+                if let blocked = usable(band[i]) { return (i, blocked) }
+                rejected.insert(i)
+            }
+            return nil
+        }
+        var cursor = start
+        var chains = 0
+        while chains < 50 {
+            chains += 1
+            let open = band.indices.filter(free)
+            guard !open.isEmpty else { break }
+            // Nearest the cursor, where the loop wants to be.
+            func startScore(_ i: Int) -> Float {
+                (cursor.map { simd_distance(band[i], $0) } ?? 0) + 2 * cost[i]
+            }
+            let first = open.sorted { startScore($0) < startScore($1) }
+            guard let (i0, b0) = pick(first) else { continue }
+            var cur = band[i0]
+            taken.append(cur)
+            out.append((cur, b0))
+            var dir: SIMD2<Float>?
+            while out.count < 400 {
+                let next = band.indices.filter { i in
+                    let d = simd_distance(band[i], cur)
+                    return d >= 0.75 * s && d <= 1.3 * s && free(i)
+                }
+                guard !next.isEmpty else { break }
+                func score(_ i: Int) -> Float {
+                    let v = band[i] - cur
+                    let d = simd_length(v)
+                    let fit = abs(d - s) / s
+                    let off = 2 * cost[i]
+                    guard let dir else { return -fit - off }
+                    return simd_dot(v / d, dir) - 0.3 * fit - off
+                }
+                guard let (i, b) = pick(
+                    next.sorted { score($0) > score($1) })
+                else { break }
+                let p = band[i]
+                dir = simd_normalize(p - cur)
+                cur = p
+                taken.append(cur)
+                out.append((cur, b))
+            }
+            cursor = cur
+        }
+        return out
     }
 
     // MARK: - Helpers

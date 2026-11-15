@@ -64,6 +64,13 @@ struct LensCurve {
     /// Rays further than this from the lens axis (radians) are outside
     /// the lens and come out black.
     let maxTheta: Float
+    /// Each lens's own calibration, the front (left half) then the back:
+    /// when set, sampleLens places rays with these, each lens at its own
+    /// centre, instead of the curve above in the middle of each half.
+    /// X6Lens sets them for the X6.
+    var lenses: [ThinPrismLens]? = nil
+    /// Where the lens came from, for the export trace.
+    var note: String = ""
 
     func radius(_ theta: Float, height: Float) -> Float {
         let t2 = theta * theta
@@ -115,6 +122,26 @@ enum DualFisheyeStitcher {
         case .original: return .original
         case .measuredX6, .sdkStitcher: return .measuredX6
         }
+    }
+
+    /// The lens the COLMAP export cuts a photo with: the X6's hardcoded
+    /// lenses (X6Lens) for an X6 photo 7760 px a lens, else
+    /// lensCurve(forModel:). The export's rig calibration cuts its tiles
+    /// with the same lens. Capture and the Calibration screen keep
+    /// lensCurve(forModel:).
+    static func exportLens(forModel model: String, photo: URL?) -> LensCurve {
+        if X6Lens.isX6(model), let url = photo,
+           let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(
+               source, 0, nil) as? [CFString: Any],
+           props[kCGImagePropertyPixelWidth] as? Int == 2 * X6Lens.size,
+           props[kCGImagePropertyPixelHeight] as? Int == X6Lens.size {
+            return X6Lens.lens
+        }
+        var lens = lensCurve(forModel: model)
+        lens.note = "the 360 lens setting's curve ("
+            + PanoramaLensModel.current.title + ")"
+        return lens
     }
 
     // MARK: - Panoramas in the app's 360 frame
@@ -830,10 +857,20 @@ enum DualFisheyeStitcher {
         mirror: Bool
     ) -> (Float, Float, Float) {
         guard theta < lens.maxTheta else { return (0, 0, 0) }
-        let r = lens.radius(theta, height: Float(srcH))
 
         let px: Float, py: Float
-        if rxy > 1e-6 {
+        if let own = lens.lenses {
+            // The lens's own calibration, in its half of the photo.
+            let l = own[mirror ? 1 : 0]
+            guard theta < l.maxThetaF else { return (0, 0, 0) }
+            let ux = rxy > 1e-6 ? (mirror ? -bx : bx) / rxy : 0
+            let uy = rxy > 1e-6 ? by / rxy : 0
+            let p = l.pixel(theta: theta, ux: ux, uy: uy,
+                            height: Float(srcH))
+            px = p.x + (mirror ? Float(srcW / 2) : 0)
+            py = p.y
+        } else if rxy > 1e-6 {
+            let r = lens.radius(theta, height: Float(srcH))
             let dx = mirror ? -bx : bx
             px = cx + r * (dx / rxy)
             py = cy + r * (by / rxy)

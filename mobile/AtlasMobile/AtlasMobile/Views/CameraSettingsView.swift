@@ -8,9 +8,37 @@ struct CameraSettingsView: View {
     @State private var connectionStatus: String?
     @State private var isTesting = false
     @State private var connectionLog: [String] = []
+    /// The 360 shot guide's route and the spacing of each route's spots
+    /// (PanoramaGuide.settings reads them).
+    @AppStorage(PanoramaGuide.routeKey)
+    private var guideRoute: PanoramaGuide.Route = .coverage
+    @AppStorage(PanoramaGuide.Route.coverage.spacingKey)
+    private var coverageSpacing = PanoramaGuide.Route.coverage.defaultSpacing
+    @AppStorage(PanoramaGuide.Route.loops.spacingKey)
+    private var loopsSpacing = PanoramaGuide.Route.loops.defaultSpacing
 
     var body: some View {
         List {
+            Section("360 Shot Guide") {
+                Picker("Route", selection: $guideRoute) {
+                    ForEach(PanoramaGuide.Route.allCases) { route in
+                        Text(route.title).tag(route)
+                    }
+                }
+                let spacing = guideRoute == .coverage
+                    ? $coverageSpacing : $loopsSpacing
+                Stepper(
+                    value: spacing,
+                    in: PanoramaGuide.spacingRange, step: 0.1
+                ) {
+                    Text(String(format: "Distance between spots: %.1f m",
+                                spacing.wrappedValue))
+                }
+                Text(guideRoute.detail)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
             Section("Configured Cameras") {
                 if config.cameras.isEmpty {
                     Text("No Insta360 cameras configured")

@@ -306,7 +306,10 @@ final class RigCalibrator {
         let calibX5 = x5Picks
         let rollDeg = DualFisheyeStitcher.rollCorrection(
             forModel: camCfg.model)
-        let lens = DualFisheyeStitcher.lensCurve(forModel: camCfg.model)
+        // Tiles are cut with the lens the export's cameras describe
+        // (exportLens: the camera's factory calibration when the photo has
+        // one), so the rig solved here fits them.
+        var lensNoted = false
 
         // Tiles are cut at the feature resolution. The old bridge cut at
         // tileExtractSize and then downscaled to maxWidth; tileScale in
@@ -336,6 +339,12 @@ final class RigCalibrator {
                 continue
             }
             x5Loaded += 1
+            let lens = DualFisheyeStitcher.exportLens(
+                forModel: camCfg.model, photo: srcURL)
+            if !lensNoted && !isPanorama {
+                log("360 lens: " + lens.note)
+                lensNoted = true
+            }
 
             for fi in 0..<nFaces {
                 autoreleasepool {

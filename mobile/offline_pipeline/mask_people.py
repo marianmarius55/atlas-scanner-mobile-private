@@ -1,11 +1,20 @@
 """
 Masks people out of an Atlas Mobile session's COLMAP model with SAM 3, run by
-Spirula Studio (https://github.com/harry7557558/spirula-studio).
+Spirula Studio (https://github.com/harry7557558/spirula-studio), and the
+area outside each 360 lens with Spirula's own border mask.
 
 Every image in <session>/colmap/images/ (iPhone photos and 360 views) is
 searched for people. Their pixels turn black in the image's mask in
 colmap/masks/ (white = keep, as COLMAP and Spirula read masks). A mask the
-export already wrote is kept: the new mask removes both.
+export already wrote is kept: the new mask removes both. iPhone photos are
+searched for "person"; 360 images with the prompts of Spirula's 360-camera
+dataset preset (whoever holds the camera, what they carry and their shadow;
+pictures and statues of people are kept).
+
+The lens images the app cuts out of each 360 photo (colmap/images/fisheye_*)
+also lose what lies outside the lens circle: `spirula sam mask` fits the
+circle over each folder's images and pulls it in by 1%, Spirula's "Remove
+fixed areas of the frame" with its default settings.
 
 An iPhone photo (colmap/images/face_iphone/scan_NNN.jpg) with a person in it
 also loses its LiDAR: that scan's points leave colmap/sparse/0/points3D.bin,
@@ -49,6 +58,14 @@ WORK_DIR = "people_mask_work"
 MANIFEST = "manifest.json"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 IPHONE_DIR = "face_iphone"
+# The app's folders of lens images cut out of the 360 photos.
+FISHEYE_PREFIX = "fisheye_"
+# Spirula Studio's "360-camera" dataset preset (src/app/gui/DatasetPreset.cpp):
+# whoever holds a 360 camera is in every frame of it, and so are whatever they
+# carry and their shadow; people that are pictures or carvings are kept.
+PROMPT_360 = ("tourist; visitor; pedestrian; photographer; child; person; hand; "
+              "backpack; selfie stick; shadow of person")
+NEGATIVE_360 = "painting; statue; poster"
 # Checkpoints Spirula Studio downloads, best first (q4_0 is a smaller file
 # of the same model; both load as fp16).
 MODEL_FILES = ("sam3-f16.ggml", "sam3-q4_0.ggml")
@@ -170,13 +187,17 @@ def _run_spirula(cmd: list[str], log: Log | None = None, total: int = 0) -> None
 
 
 def find_people(exe: Path, model: Path, images: list[Path], work: Path,
-                prompt: str, jobs: int, log: Log) -> list[Path | None]:
-    """Masks `prompt` in every image. Returns each image's mask file
-    (white = keep, black = matched), or None where spirula wrote none."""
+                prompt: str, jobs: int, log: Log,
+                negative: str | None = None) -> list[Path | None]:
+    """Masks `prompt` in every image, keeping what `negative` matches.
+    Returns each image's mask file (white = keep, black = matched), or None
+    where spirula wrote none."""
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     base = [str(exe), "sam", "track", "--model", str(model), "--text", prompt,
             "--accept-license", "sam3=yes"]
+    if negative:
+        base += ["--neg-text", negative]
 
     if supports_image_mode(exe):
         frames, out = work / "in", work / "out"
@@ -217,6 +238,40 @@ def find_people(exe: Path, model: Path, images: list[Path], work: Path,
             log(f"  warning: spirula wrote no mask for {image.name} (unreadable image?)")
             result.append(None)
     return result
+
+
+def find_lens_edges(exe: Path, images_dir: Path, work: Path,
+                    log: Log) -> dict[str, Path]:
+    """Spirula's border mask for each folder of 360 lens images
+    (images/fisheye_*): `spirula sam mask` with its defaults fits the lens
+    circle over the folder's images (24 at most) and keeps what is inside
+    it, pulled in by 1%. Returns each image's mask file by its path under
+    images/ (white = inside the lens)."""
+    shutil.rmtree(work, ignore_errors=True)
+    found: dict[str, Path] = {}
+    folders = sorted(p for p in images_dir.iterdir()
+                     if p.is_dir() and p.name.startswith(FISHEYE_PREFIX))
+    for folder in folders:
+        out = work / folder.name
+        out.mkdir(parents=True)
+        proc = subprocess.run([str(exe), "sam", "mask", str(folder), "--out", str(out),
+                               "--replace"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+        lines = [ln.strip() for ln in (proc.stdout + proc.stderr).splitlines() if ln.strip()]
+        if proc.returncode != 0:
+            raise RuntimeError(f"spirula sam mask exited with code {proc.returncode} on "
+                               f"{folder.name}:\n" + "\n".join(lines[-15:]))
+        # "border: ellipse 0.4987,0.5004,0.5078,0.5078 -- keeps 80.6% of the frame"
+        # or "no border found in ...; name one with --shape"
+        said = next((ln for ln in lines if ln.startswith(("border:", "no border"))),
+                    "spirula said nothing about a border")
+        log(f"  lens edge, {folder.name}: {said}")
+        for image in folder.iterdir():
+            if image.is_file() and image.suffix.lower() in IMAGE_EXTS:
+                mask = out / f"{image.stem}.png"
+                if mask.is_file():
+                    found[f"{folder.name}/{image.name}"] = mask
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -367,18 +422,27 @@ def mask_path_for(colmap: Path, rel: str) -> tuple[Path, bool]:
     return folder / f"{image.stem}.png", False
 
 
-def write_person_mask(colmap: Path, rel: str, person: np.ndarray,
-                      backup: Backup) -> None:
+def write_mask(colmap: Path, rel: str, person: np.ndarray | None,
+               inside: np.ndarray | None, backup: Backup) -> None:
+    """Takes `person` (True where a person is) and everything outside
+    `inside` (True inside the lens) out of the image's mask; either may be
+    None. A mask the image already has is kept and narrowed."""
     path, existed = mask_path_for(colmap, rel)
-    if existed:
-        keep = np.asarray(Image.open(path).convert("L")) >= 128
-        if keep.shape != person.shape:
-            resized = Image.fromarray(person.astype(np.uint8) * 255).resize(
-                (keep.shape[1], keep.shape[0]), Image.NEAREST)
-            person = np.asarray(resized) >= 128
-        keep &= ~person
-    else:
-        keep = ~person
+    shape = (person if person is not None else inside).shape
+    keep = (np.asarray(Image.open(path).convert("L")) >= 128 if existed
+            else np.ones(shape, dtype=bool))
+
+    def fit(part: np.ndarray) -> np.ndarray:
+        if part.shape == keep.shape:
+            return part
+        resized = Image.fromarray(part.astype(np.uint8) * 255).resize(
+            (keep.shape[1], keep.shape[0]), Image.NEAREST)
+        return np.asarray(resized) >= 128
+
+    if person is not None:
+        keep &= ~fit(person)
+    if inside is not None:
+        keep &= fit(inside)
     backup.will_write_mask(path, existed)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -555,10 +619,15 @@ def remove_lidar(session: Path, scans: list[str], backup: Backup,
 
 def mask_session(session_dir: Path | str, spirula: str | None = None,
                  sam_model: str | None = None, prompt: str = "person",
-                 jobs: int = 3, log: Log = print) -> dict:
-    """Masks `prompt` (people) in the session's COLMAP images and removes
-    the LiDAR of iPhone photos showing them. Raises MaskingUnavailable when
-    Spirula or the SAM 3 checkpoint isn't found."""
+                 jobs: int = 3, log: Log = print,
+                 prompt_360: str = PROMPT_360,
+                 negative_360: str | None = NEGATIVE_360,
+                 lens_edge: bool = True) -> dict:
+    """Masks people in the session's COLMAP images (`prompt` in the iPhone
+    photos, `prompt_360` but not `negative_360` in the 360 images), and the
+    area outside each 360 lens, and removes the LiDAR of iPhone photos
+    showing people. Raises MaskingUnavailable when Spirula or the SAM 3
+    checkpoint isn't found."""
     session = Path(session_dir).resolve()
     colmap = session / "colmap"
     images_dir = colmap / "images"
@@ -576,21 +645,45 @@ def mask_session(session_dir: Path | str, spirula: str | None = None,
         return {"images": 0, "people": {}, "lidar_removed": {}}
 
     work = session / WORK_DIR
+    iphone_images = [p for p in images if p.parent.name == IPHONE_DIR]
+    images_360 = [p for p in images if p.parent.name != IPHONE_DIR]
+    edges_kept: dict[str, list[float]] = {}
     try:
-        mask_files = find_people(exe, model, images, work, prompt, jobs, log)
+        mask_files: dict[Path, Path | None] = {}
+        if iphone_images:
+            log(f'  iPhone photos: SAM 3 masks "{prompt}"')
+            mask_files.update(zip(iphone_images, find_people(
+                exe, model, iphone_images, work / "iphone", prompt, jobs, log)))
+        if images_360:
+            log(f'  360 images: SAM 3 masks "{prompt_360}"'
+                + (f', keeping "{negative_360}"' if negative_360 else "")
+                + " (Spirula's 360-camera preset)")
+            mask_files.update(zip(images_360, find_people(
+                exe, model, images_360, work / "360", prompt_360, jobs, log,
+                negative=negative_360)))
+        edges = find_lens_edges(exe, images_dir, work / "edges", log) if lens_edge else {}
         # Only now, with the new masks ready, go back to the original files.
         restore(session, log)
         backup = Backup(session)
         people: dict[str, float] = {}
-        for image, mask_file in zip(images, mask_files):
-            if mask_file is None:
-                continue
-            person = np.asarray(Image.open(mask_file).convert("L")) < 128
-            if not person.any():
-                continue
+        for image in images:
             rel = image.relative_to(images_dir).as_posix()
-            people[rel] = round(100.0 * float(person.mean()), 2)
-            write_person_mask(colmap, rel, person, backup)
+            person = None
+            mask_file = mask_files.get(image)
+            if mask_file is not None:
+                found = np.asarray(Image.open(mask_file).convert("L")) < 128
+                if found.any():
+                    person = found
+                    people[rel] = round(100.0 * float(found.mean()), 2)
+            inside = None
+            if rel in edges:
+                lens = np.asarray(Image.open(edges[rel]).convert("L")) >= 128
+                if not lens.all():
+                    inside = lens
+                    edges_kept.setdefault(image.parent.name, []).append(
+                        100.0 * float(lens.mean()))
+            if person is not None or inside is not None:
+                write_mask(colmap, rel, person, inside, backup)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -605,14 +698,18 @@ def mask_session(session_dir: Path | str, spirula: str | None = None,
         f"{len(images) - n_iphone} 360 images")
     for rel, share in sorted(people.items()):
         log(f"    {rel}: {share:.2f}% masked")
+    for folder, kept in sorted(edges_kept.items()):
+        log(f"  lens edge masked in {len(kept)} {folder} images, "
+            f"{kept[0]:.1f}% of each kept")
     if iphone:
         total = sum(lidar_removed.values())
         log(f"  LiDAR removed from {len(iphone)} iPhone photos ({total} points): "
             + ", ".join(iphone))
-    if people:
+    if people or edges_kept:
         log(f"  originals backed up in {session / BACKUP_DIR} "
             "(--undo puts them back)")
-    return {"images": len(images), "people": people, "lidar_removed": lidar_removed}
+    return {"images": len(images), "people": people, "lidar_removed": lidar_removed,
+            "lens_edge": {f: len(k) for f, k in edges_kept.items()}}
 
 
 def main() -> None:
@@ -629,7 +726,16 @@ def main() -> None:
                         help="SAM 3 checkpoint (default: the one Spirula Studio "
                              "downloaded)")
     parser.add_argument("--prompt", default="person",
-                        help='what to mask, ";" between several (default: person)')
+                        help='what to mask in the iPhone photos, ";" between several '
+                             "(default: person)")
+    parser.add_argument("--prompt-360", default=PROMPT_360,
+                        help="what to mask in the 360 images (default: Spirula's "
+                             f'360-camera preset, "{PROMPT_360}")')
+    parser.add_argument("--neg-prompt-360", default=NEGATIVE_360,
+                        help="what to keep in the 360 images even where --prompt-360 "
+                             f'matches (default: "{NEGATIVE_360}")')
+    parser.add_argument("--no-lens-edge", action="store_true",
+                        help="don't mask the area outside the 360 lens circles")
     parser.add_argument("--jobs", type=int, default=3,
                         help="spirula processes at once with builds older than "
                              "v2026.11.12 (default: 3, about 2.5 GB of GPU memory each)")
@@ -648,7 +754,10 @@ def main() -> None:
         return
     print(f"Masking people in {session}")
     try:
-        mask_session(session, args.spirula, args.sam_model, args.prompt, args.jobs)
+        mask_session(session, args.spirula, args.sam_model, args.prompt, args.jobs,
+                     prompt_360=args.prompt_360,
+                     negative_360=args.neg_prompt_360 or None,
+                     lens_edge=not args.no_lens_edge)
     except (MaskingUnavailable, FileNotFoundError, RuntimeError) as e:
         sys.exit(f"error: {e}")
 

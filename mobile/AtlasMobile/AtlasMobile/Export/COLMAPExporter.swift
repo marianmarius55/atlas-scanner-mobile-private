@@ -24,12 +24,45 @@ final class COLMAPExporter {
         case simplePinhole = 0  // f, cx, cy — Insta360 face tiles
         case pinhole = 1        // fx, fy, cx, cy — iPhone
         case opencvFisheye = 5  // fx, fy, cx, cy, k1, k2, k3, k4
+        // fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, sx1, sy1 — the lenses of
+        // a 360 photo cut at full size (Spirula's 360-camera model)
+        case thinPrismFisheye = 10
     }
 
     // Fisheye lens constants — match DualFisheyeStitcher's equidistant model
+    // (lenses reprojected from a panorama; a raw photo's lenses are cut)
     private static let fisheyeSize = 2048
     private static let fisheyeHalfFovRad: Float = 100 * .pi / 180
     private static let fisheyeRadiusFrac: Float = 0.47
+    /// Spirula writes the lenses it cuts out of a 360 photo at JPEG
+    /// quality 95 (kPhotoJpegQuality, src/app/gui/DatasetPrep.h).
+    private static let lensJPEGQuality: CGFloat = 0.95
+
+    /// How fisheye mode exports one 360 camera (planFisheyeLenses).
+    private struct FisheyeLensPlan {
+        let cameraId: String
+        let front: UInt32
+        let back: UInt32
+        /// The raw photo's two lenses cut at full size; false: lenses
+        /// reprojected from panoramas (fisheyeSize, equidistant).
+        let cut: Bool
+        /// One lens image's size (cut).
+        let width: Int
+        let height: Int
+        let lens: LensCurve
+        /// Each lens as THIN_PRISM_FISHEYE (cut).
+        let frontLens: ThinPrismLens?
+        let backLens: ThinPrismLens?
+        /// The camera model's roll correction, which a cut lens image
+        /// keeps, so it goes into the lens poses instead (lensRoll).
+        let rollDeg: Float
+        /// The back lens's camera from the front lens's: measured for the
+        /// X6 (X6Lens), exactly back to back otherwise.
+        let backFromFront: simd_float3x3
+    }
+
+    /// Set by export() in fisheye mode, one per camera of the config.
+    private var fisheyePlans: [FisheyeLensPlan] = []
 
     // 180° rotation around Y — front lens → back lens orientation
     private static let R_y_pi = simd_float3x3(rows: [
@@ -529,6 +562,20 @@ final class COLMAPExporter {
         print("[Export] \(checkNote)")
         ExportTrace.note(checkNote)
 
+        // Fisheye mode cuts each raw 360 photo into its two lenses at full
+        // size, as Spirula Studio does.
+        fisheyePlans = []
+        if cameraExportMode == .nativeFisheye {
+            let planned = planFisheyeLenses(
+                scans: filteredScans, cameraConfig: cameraConfig)
+            filteredScans = planned.scans
+            fisheyePlans = planned.plans
+            for note in planned.notes {
+                print("[Export] \(note)")
+                ExportTrace.note(note)
+            }
+        }
+
         let hasInsta360 = filteredScans.contains { !$0.insta360ImageURLs.isEmpty }
 
         // Landscape values from pose.json (sensor native frame).
@@ -714,10 +761,24 @@ final class COLMAPExporter {
             for v in [f_tile, c_tile, c_tile] { data.appendLE(Double(v)) }
         }
 
-        // Fisheye lenses — OPENCV_FISHEYE: fx, fy, cx, cy, k1, k2, k3, k4
-        for ids in fisheyeCameraIds {
-            for camId in [ids.front, ids.back] {
+        // Fisheye lenses. Cut from a raw photo at full size:
+        // THIN_PRISM_FISHEYE with each lens's own calibration, the model
+        // Spirula's 360-camera preset uses. Reprojected from a panorama:
+        // OPENCV_FISHEYE, equidistant.
+        for (i, ids) in fisheyeCameraIds.enumerated() {
+            let plan = i < fisheyePlans.count ? fisheyePlans[i] : nil
+            for (camId, own) in [(ids.front, plan?.frontLens),
+                                 (ids.back, plan?.backLens)] {
                 data.appendLE(camId)
+                if let plan, plan.cut, let own {
+                    data.appendLE(CameraModel.thinPrismFisheye.rawValue)
+                    data.appendLE(UInt64(plan.width))
+                    data.appendLE(UInt64(plan.height))
+                    for v in own.colmapParams(height: plan.height) {
+                        data.appendLE(v)
+                    }
+                    continue
+                }
                 data.appendLE(CameraModel.opencvFisheye.rawValue)
                 data.appendLE(UInt64(fisheyeSize))
                 data.appendLE(UInt64(fisheyeSize))
@@ -813,8 +874,9 @@ final class COLMAPExporter {
                     if !fisheyeCameraIds.isEmpty {
                         // Fisheye mode — 2 images per camera (front + back lens)
                         let ids = fisheyeCameraIds[camIdx]
+                        let roll = cutRoll(camIdx)
 
-                        let R_front = R_insta_col
+                        let R_front = Self.lensRoll(roll) * R_insta_col
                         let t_front = -(R_front * C_insta_col)
                         entries.append(ImageEntry(
                             imageId: imageId,
@@ -826,7 +888,8 @@ final class COLMAPExporter {
                         ))
                         imageId += 1
 
-                        let R_back = Self.R_y_pi * R_insta_col
+                        let R_back = Self.lensRoll(-roll)
+                            * backTurn(camIdx) * R_insta_col
                         let t_back = -(R_back * C_insta_col)
                         entries.append(ImageEntry(
                             imageId: imageId,
@@ -1326,8 +1389,10 @@ final class COLMAPExporter {
             if !fisheyeCameraIds.isEmpty {
                 let ids = fisheyeCameraIds[camIdx]
 
-                let Rc = R_insta * Self.arkitToColmap * rRotT
-                let t_front = t_insta
+                let roll = cutRoll(camIdx)
+                let Rc = Self.lensRoll(roll)
+                    * R_insta * Self.arkitToColmap * rRotT
+                let t_front = Self.lensRoll(roll) * t_insta
                 let qF = Self.rotationToQuatWXYZ(Rc)
                 data.appendLE(sensorTypeCamera)
                 data.appendLE(ids.front)
@@ -1337,8 +1402,10 @@ final class COLMAPExporter {
                 data.appendLE(Double(t_front.y))
                 data.appendLE(Double(t_front.z))
 
-                let R_back = Self.R_y_pi * Rc
-                let t_back = Self.R_y_pi * t_insta
+                let unrolled = R_insta * Self.arkitToColmap * rRotT
+                let turn = backTurn(camIdx)
+                let R_back = Self.lensRoll(-roll) * turn * unrolled
+                let t_back = Self.lensRoll(-roll) * turn * t_insta
                 let qB = Self.rotationToQuatWXYZ(R_back)
                 data.appendLE(sensorTypeCamera)
                 data.appendLE(ids.back)
@@ -1567,7 +1634,33 @@ final class COLMAPExporter {
                 guard let mp = mPx else { return }
 
                 var tiles: [Int: Data] = [:]
-                if useFisheye {
+                if useFisheye,
+                   let plan = fisheyePlans.first(where: {
+                       $0.cameraId == camId }),
+                   plan.cut
+                {
+                    // Lenses cut at full size: the drawn mask goes onto
+                    // each lens where the Calibration screen's stitch,
+                    // which it was drawn over, put the lens.
+                    let model = cameraConfig.cameras
+                        .first { $0.id == camId }?.model ?? ""
+                    let drawnOn = DualFisheyeStitcher
+                        .lensCurve(forModel: model)
+                    let roll = DualFisheyeStitcher
+                        .rollCorrection(forModel: model)
+                    for isFront in [true, false] {
+                        autoreleasepool {
+                            if let png = Self.lensMaskFromERP(
+                                maskPx: mp.px, erpW: mp.w, erpH: mp.h,
+                                width: plan.width, height: plan.height,
+                                isFrontLens: isFront, rollDeg: roll,
+                                lens: drawnOn)
+                            {
+                                tiles[isFront ? 0 : 1] = png
+                            }
+                        }
+                    }
+                } else if useFisheye {
                     let feSize = Self.fisheyeSize
                     for isFront in [true, false] {
                         autoreleasepool {
@@ -1744,7 +1837,8 @@ final class COLMAPExporter {
                                 rollDeg: roll,
                                 allowSubsample: useFisheye,
                                 lens: DualFisheyeStitcher
-                                    .lensCurve(forModel: model)
+                                    .exportLens(forModel: model,
+                                                photo: erpURL)
                             )
                     } else {
                         let img = autoreleasepool {
@@ -1779,7 +1873,53 @@ final class COLMAPExporter {
                     return px
                 }
 
-                if useFisheye {
+                if useFisheye,
+                   let plan = fisheyePlans.first(where: {
+                       $0.cameraId == camId }),
+                   plan.cut
+                {
+                    // Spirula's cut: the photo's two lenses at full size,
+                    // no resampling, each a JPEG at quality 95 with the
+                    // photo's EXIF (planFisheyeLenses).
+                    let meta = Self.lensMetadata(
+                        photo: erpURL,
+                        width: plan.width, height: plan.height)
+                    let cut = Self.cutLenses(
+                        url: erpURL,
+                        width: plan.width, height: plan.height
+                    ) { k, px in
+                        let subdir = k == 0
+                            ? "fisheye_front" : "fisheye_back"
+                        if let cp = colorProfile {
+                            Self.applyColorProfile(
+                                cp, to: &px,
+                                width: plan.width,
+                                height: plan.height)
+                        }
+                        Self.writeJPEGFromPixels(
+                            &px,
+                            width: plan.width,
+                            height: plan.height,
+                            quality: Self.lensJPEGQuality,
+                            to: imagesDir
+                                .appendingPathComponent(subdir)
+                                .appendingPathComponent(
+                                    "\(scan.scanName).jpg"),
+                            metadata: meta)
+                        if let png = camTiles?[k] {
+                            try? png.write(
+                                to: masksDir
+                                    .appendingPathComponent(subdir)
+                                    .appendingPathComponent(
+                                        "\(scan.scanName).png"))
+                        }
+                    }
+                    if !cut {
+                        print("[Export] could not cut the lenses of"
+                            + " \(scan.scanName)"
+                            + " (\(erpURL.lastPathComponent))")
+                    }
+                } else if useFisheye {
                     let feSize = Self.fisheyeSize
                     let model = cameraConfig.cameras
                         .first { $0.id == camId }?
@@ -1787,7 +1927,7 @@ final class COLMAPExporter {
                     let roll = DualFisheyeStitcher
                         .rollCorrection(forModel: model)
                     let lens = DualFisheyeStitcher
-                        .lensCurve(forModel: model)
+                        .exportLens(forModel: model, photo: erpURL)
 
                     // Check if source is dual-fisheye (an SDK
                     // panorama is 2:1 too; see isAppPanorama)
@@ -1993,7 +2133,8 @@ final class COLMAPExporter {
                             .rollCorrection(
                                 forModel: model)
                         let lens = DualFisheyeStitcher
-                            .lensCurve(forModel: model)
+                            .exportLens(forModel: model,
+                                        photo: erpURL)
                         let faceRots =
                             ERPTileSlicer
                                 .computeFaceRotations()
@@ -2223,7 +2364,8 @@ final class COLMAPExporter {
     private static func writeJPEGFromPixels(
         _ px: inout [UInt8],
         width: Int, height: Int,
-        quality: CGFloat, to url: URL
+        quality: CGFloat, to url: URL,
+        metadata: [CFString: Any] = [:]
     ) {
         guard let ctx = CGContext(
             data: &px, width: width, height: height,
@@ -2240,10 +2382,10 @@ final class COLMAPExporter {
                 "public.jpeg" as CFString, 1, nil
             )
         else { return }
+        var options = metadata
+        options[kCGImageDestinationLossyCompressionQuality] = quality
         CGImageDestinationAddImage(
-            dest, cg,
-            [kCGImageDestinationLossyCompressionQuality:
-                quality] as CFDictionary
+            dest, cg, options as CFDictionary
         )
         guard CGImageDestinationFinalize(dest)
         else { return }
@@ -3185,6 +3327,384 @@ final class COLMAPExporter {
         return PoseInterpolation.interpolate(
             from: before.pose, to: after.pose, t: t
         )
+    }
+}
+
+// MARK: - 360 lenses cut at full size (fisheye mode)
+
+extension COLMAPExporter {
+
+    /// How fisheye mode exports each camera of the config, and the scans
+    /// without any 360 photo its camera can't take. A camera with raw
+    /// dual-fisheye photos has each photo cut into its two lenses at full
+    /// size, as Spirula Studio cuts an Insta360 photo (split_packed_image
+    /// and app::packed_lens_crop in its source: the left half is lens 0,
+    /// here the front lens; the right half lens 1, the back), with no
+    /// resampling. Each lens is a THIN_PRISM_FISHEYE camera, the model
+    /// Spirula's 360-camera preset gives a 360 camera's lenses, from the
+    /// lens exportLens gives the camera's first photo: its factory
+    /// calibration, or the 360 lens setting's curve. One COLMAP camera has
+    /// one size and one lens, so a photo of another size or calibration
+    /// is left out. A camera with panoramas only (SDK stitcher) keeps the
+    /// lenses reprojected from them.
+    private func planFisheyeLenses(
+        scans: [ScanExportData], cameraConfig: MultiCameraConfig
+    ) -> (scans: [ScanExportData], plans: [FisheyeLensPlan],
+          notes: [String]) {
+        var plans: [FisheyeLensPlan] = []
+        var notes: [String] = []
+        var leaveOut: [String: Set<String>] = [:]
+        for (i, camCfg) in cameraConfig.cameras.enumerated() {
+            let front = UInt32(2 + i * 2), back = UInt32(3 + i * 2)
+            let photos: [(name: String, url: URL)] = scans.compactMap {
+                scan in
+                scan.insta360ImageURLs[camCfg.id].map {
+                    (name: scan.scanName, url: $0)
+                }
+            }
+            let sizes = photos.map { Self.dualFisheyeSize($0.url) }
+            guard let firstRaw = sizes.firstIndex(where: { $0 != nil }),
+                  let size = sizes[firstRaw]
+            else {
+                plans.append(FisheyeLensPlan(
+                    cameraId: camCfg.id, front: front, back: back,
+                    cut: false,
+                    width: Self.fisheyeSize, height: Self.fisheyeSize,
+                    lens: .original, frontLens: nil, backLens: nil,
+                    rollDeg: 0, backFromFront: Self.R_y_pi))
+                if !photos.isEmpty {
+                    notes.append("360 camera \(camCfg.id): no raw"
+                        + " dual-fisheye photo, so its lenses are"
+                        + " reprojected from the panoramas at"
+                        + " \(Self.fisheyeSize) px")
+                }
+                continue
+            }
+            let model = camCfg.model
+            let lens = DualFisheyeStitcher.exportLens(
+                forModel: model, photo: photos[firstRaw].url)
+            var other: [String] = []
+            for (k, photo) in photos.enumerated() {
+                if let s = sizes[k], s.w == size.w, s.h == size.h,
+                   DualFisheyeStitcher.exportLens(
+                       forModel: model, photo: photo.url).note == lens.note
+                {
+                    continue
+                }
+                other.append(photo.name)
+            }
+            if !other.isEmpty {
+                leaveOut[camCfg.id] = Set(other)
+                notes.append("360 camera \(camCfg.id): left out"
+                    + " \(other.count) photos that aren't"
+                    + " \(size.w)×\(size.h) with the lens of the first: "
+                    + other.joined(separator: ", "))
+            }
+            let halfW = size.w / 2
+            let own = lens.lenses ?? []
+            let frontLens = own.count == 2 ? own[0]
+                : ThinPrismLens(curve: lens, halfWidth: halfW,
+                                height: size.h)
+            let backLens = own.count == 2 ? own[1]
+                : ThinPrismLens(curve: lens, halfWidth: halfW,
+                                height: size.h)
+            plans.append(FisheyeLensPlan(
+                cameraId: camCfg.id, front: front, back: back, cut: true,
+                width: halfW, height: size.h, lens: lens,
+                frontLens: frontLens, backLens: backLens,
+                rollDeg: DualFisheyeStitcher.rollCorrection(
+                    forModel: model),
+                backFromFront: own.count == 2
+                    ? X6Lens.backFromFront : Self.R_y_pi))
+            notes.append("360 camera \(camCfg.id): each photo cut into"
+                + " its 2 lenses at full size (\(halfW)×\(size.h) px"
+                + " each, JPEG quality 95) as Spirula Studio cuts an"
+                + " .insp; lenses: " + lens.note)
+        }
+        guard !leaveOut.isEmpty else { return (scans, plans, notes) }
+        let kept = scans.map { scan -> ScanExportData in
+            let urls = scan.insta360ImageURLs.filter {
+                leaveOut[$0.key]?.contains(scan.scanName) != true
+            }
+            guard urls.count != scan.insta360ImageURLs.count else {
+                return scan
+            }
+            return ScanExportData(
+                scanName: scan.scanName,
+                arkitPose: scan.arkitPose,
+                intrinsics: scan.intrinsics,
+                imageWidth: scan.imageWidth,
+                imageHeight: scan.imageHeight,
+                depthBinURL: scan.depthBinURL,
+                smoothedDepthBinURL: scan.smoothedDepthBinURL,
+                iphoneImageURL: scan.iphoneImageURL,
+                insta360ImageURLs: urls,
+                insta360CommandTimestamp: scan.insta360CommandTimestamp)
+        }
+        return (kept, plans, notes)
+    }
+
+    /// The roll correction folded into camera `camIdx`'s lens poses: the
+    /// model's, for lenses cut from the raw photo; none for lenses
+    /// reprojected from a panorama, which come out without it.
+    private func backTurn(_ camIdx: Int) -> simd_float3x3 {
+        guard camIdx < fisheyePlans.count, fisheyePlans[camIdx].cut
+        else { return Self.R_y_pi }
+        return fisheyePlans[camIdx].backFromFront
+    }
+
+    private func cutRoll(_ camIdx: Int) -> Float {
+        guard camIdx < fisheyePlans.count, fisheyePlans[camIdx].cut
+        else { return 0 }
+        return fisheyePlans[camIdx].rollDeg
+    }
+
+    /// A turn of `deg` degrees about a camera's optical axis, applied to
+    /// camera coordinates. The stitcher turns a ray by the model's roll
+    /// correction before it finds it in the photo, so a lens image cut
+    /// from the photo looks out of a camera turned the same way: the front
+    /// lens's by the roll, the back lens's, whose x is mirrored, by minus
+    /// the roll.
+    private static func lensRoll(_ deg: Float) -> simd_float3x3 {
+        guard abs(deg) > 0.1 else { return matrix_identity_float3x3 }
+        let a = deg * .pi / 180
+        let c = cos(a), s = sin(a)
+        return simd_float3x3(rows: [
+            SIMD3<Float>(c, -s, 0),
+            SIMD3<Float>(s, c, 0),
+            SIMD3<Float>(0, 0, 1),
+        ])
+    }
+
+    /// The size of a raw dual-fisheye photo (2:1, upright, not a panorama
+    /// the app wrote in its own 360 frame), or nil for anything else.
+    private static func dualFisheyeSize(_ url: URL) -> (w: Int, h: Int)? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(
+                source, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int,
+              h > 0, w % 2 == 0
+        else { return nil }
+        let orientation = (props[kCGImagePropertyOrientation]
+            as? NSNumber)?.intValue ?? 1
+        let ratio = Float(w) / Float(h)
+        guard orientation == 1, ratio > 1.8, ratio < 2.2,
+              !DualFisheyeStitcher.isAppPanorama(properties: props)
+        else { return nil }
+        return (w, h)
+    }
+
+    /// The whole photo as RGBA pixels at its own size, drawn the way
+    /// DualFisheyeStitcher.loadPixels draws (device RGB), so the colours
+    /// are the old export's.
+    private static func loadFullPixels(
+        url: URL
+    ) -> (px: [UInt8], w: Int, h: Int)? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(
+                source, 0,
+                [kCGImageSourceShouldCache: false] as CFDictionary)
+        else { return nil }
+        let w = image.width, h = image.height
+        guard w > 0, h > 0 else { return nil }
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = px.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(
+                data: buf.baseAddress, width: w, height: h,
+                bitsPerComponent: 8, bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+            else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        return drawn ? (px, w, h) : nil
+    }
+
+    /// Cuts the photo into its two lenses, `width` x `height` each, and
+    /// hands `body` each lens's RGBA pixels, lens 0 (the left half) first,
+    /// one at a time. False when the photo can't be read or is another
+    /// size.
+    private static func cutLenses(
+        url: URL, width: Int, height: Int,
+        _ body: (Int, inout [UInt8]) -> Void
+    ) -> Bool {
+        guard let full = loadFullPixels(url: url),
+              full.w == 2 * width, full.h == height
+        else { return false }
+        let rowBytes = width * 4
+        for k in 0..<2 {
+            autoreleasepool {
+                var lens = [UInt8](repeating: 0, count: rowBytes * height)
+                full.px.withUnsafeBytes { src in
+                    lens.withUnsafeMutableBytes { dst in
+                        guard let s = src.baseAddress,
+                              let d = dst.baseAddress
+                        else { return }
+                        for y in 0..<height {
+                            memcpy(d + y * rowBytes,
+                                   s + (y * full.w + k * width) * 4,
+                                   rowBytes)
+                        }
+                    }
+                }
+                body(k, &lens)
+            }
+        }
+        return true
+    }
+
+    /// The photo's EXIF, TIFF and GPS metadata for a lens cut out of it,
+    /// as Spirula writes one (write_jpeg_with_exif, focal dropped):
+    /// orientation 1, the lens's pixel size, and no focal length, which
+    /// describes the whole photo.
+    private static func lensMetadata(
+        photo url: URL, width: Int, height: Int
+    ) -> [CFString: Any] {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(
+                source, 0, nil) as? [CFString: Any]
+        else { return [:] }
+        var out: [CFString: Any] = [kCGImagePropertyOrientation: 1]
+        if var exif = props[kCGImagePropertyExifDictionary]
+            as? [CFString: Any] {
+            exif[kCGImagePropertyExifFocalLength] = nil
+            exif[kCGImagePropertyExifFocalLenIn35mmFilm] = nil
+            exif[kCGImagePropertyExifPixelXDimension] = width
+            exif[kCGImagePropertyExifPixelYDimension] = height
+            out[kCGImagePropertyExifDictionary] = exif
+        }
+        if var tiff = props[kCGImagePropertyTIFFDictionary]
+            as? [CFString: Any] {
+            tiff[kCGImagePropertyTIFFOrientation] = 1
+            out[kCGImagePropertyTIFFDictionary] = tiff
+        }
+        if let gps = props[kCGImagePropertyGPSDictionary] {
+            out[kCGImagePropertyGPSDictionary] = gps
+        }
+        return out
+    }
+
+    /// ColorProfileCalibrator.applyInPlace on a full-size lens image, in
+    /// bands of rows across the cores: one pixel at a time, a 60-megapixel
+    /// lens took seconds.
+    private static func applyColorProfile(
+        _ profile: ColorProfile, to px: inout [UInt8],
+        width: Int, height: Int
+    ) {
+        let bandBytes = 128 * width * 4
+        let bands = (px.count + bandBytes - 1) / bandBytes
+        px.withUnsafeMutableBytes { buf in
+            guard let base = buf.baseAddress else { return }
+            let total = buf.count
+            DispatchQueue.concurrentPerform(iterations: bands) { b in
+                let start = b * bandBytes
+                let count = min(bandBytes, total - start)
+                guard count > 0 else { return }
+                var band = [UInt8](UnsafeRawBufferPointer(
+                    start: base + start, count: count))
+                ColorProfileCalibrator.applyInPlace(profile, pixels: &band)
+                band.withUnsafeBytes { src in
+                    if let s = src.baseAddress {
+                        memcpy(base + start, s, count)
+                    }
+                }
+            }
+        }
+    }
+
+    /// A camera's drawn mask (equirectangular, drawn over the Calibration
+    /// screen's panorama, as loadMaskPixels reads it: white keeps) as the
+    /// mask of one lens cut at full size. Each pixel of the lens takes the
+    /// mask where the Calibration screen's stitch put that pixel: its
+    /// curve, in the middle of each half, and its roll. A grey PNG, white
+    /// keeps. Pixels past that curve's lens keep; the host's border mask
+    /// (Spirula's) ends the lens.
+    private static func lensMaskFromERP(
+        maskPx: [UInt8], erpW: Int, erpH: Int,
+        width: Int, height: Int, isFrontLens: Bool,
+        rollDeg: Float, lens: LensCurve
+    ) -> Data? {
+        guard erpW > 1, erpH > 1, width > 0, height > 0,
+              maskPx.count >= erpW * erpH * 4
+        else { return nil }
+        let hF = Float(height)
+        let cx = Float(width) * 0.5, cy = hF * 0.5
+        // Theta for a radius, by bisection on the curve.
+        let rMax = lens.radius(lens.maxTheta, height: hF)
+        guard rMax > 0 else { return nil }
+        let n = 4096
+        var table = [Float](repeating: 0, count: n + 1)
+        for j in 0...n {
+            let r = rMax * Float(j) / Float(n)
+            var lo: Float = 0, hi = lens.maxTheta
+            for _ in 0..<40 {
+                let mid = 0.5 * (lo + hi)
+                if lens.radius(mid, height: hF) < r { lo = mid } else { hi = mid }
+            }
+            table[j] = 0.5 * (lo + hi)
+        }
+        let rollRad = rollDeg * .pi / 180
+        let cosR = cos(rollRad), sinR = sin(rollRad)
+        let applyRoll = abs(rollDeg) > 0.1
+        let eW = Float(erpW), eH = Float(erpH)
+        var out = [UInt8](repeating: 255, count: width * height)
+        maskPx.withUnsafeBufferPointer { mask in
+            table.withUnsafeBufferPointer { tab in
+                out.withUnsafeMutableBufferPointer { buf in
+                    let dst = buf
+                    DispatchQueue.concurrentPerform(iterations: height) { v in
+                        let dy = Float(v) - cy
+                        for u in 0..<width {
+                            let dx = Float(u) - cx
+                            let r = (dx * dx + dy * dy).squareRoot()
+                            guard r < rMax else { continue }
+                            let fi = r / rMax * Float(n)
+                            let i0 = min(Int(fi), n - 1)
+                            let theta = tab[i0]
+                                + (tab[i0 + 1] - tab[i0]) * (fi - Float(i0))
+                            let s = sin(theta)
+                            let ux = r > 1e-3 ? dx / r : 0
+                            let uy = r > 1e-3 ? dy / r : 0
+                            // The ray in the 360 frame; the back lens's
+                            // frame is (-x, y, -z).
+                            var bx = isFrontLens ? s * ux : -s * ux
+                            var by = s * uy
+                            let bz = isFrontLens ? cos(theta) : -cos(theta)
+                            if applyRoll {
+                                // Undo the turn the stitcher gave the ray.
+                                let x0 = bx
+                                bx = x0 * cosR + by * sinR
+                                by = -x0 * sinR + by * cosR
+                            }
+                            let lon = atan2(bx, bz)
+                            let lat = asin(max(-1, min(1, -by)))
+                            let ex = min(max(Int((lon / (2 * .pi) + 0.5) * eW),
+                                             0), erpW - 1)
+                            let ey = min(max(Int((0.5 - lat / .pi) * eH),
+                                             0), erpH - 1)
+                            dst[v * width + u] = mask[(ey * erpW + ex) * 4]
+                        }
+                    }
+                }
+            }
+        }
+        return out.withUnsafeMutableBytes { buf -> Data? in
+            guard let ctx = CGContext(
+                data: buf.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue),
+                let cg = ctx.makeImage()
+            else { return nil }
+            let data = NSMutableData()
+            guard let dest = CGImageDestinationCreateWithData(
+                data, "public.png" as CFString, 1, nil)
+            else { return nil }
+            CGImageDestinationAddImage(dest, cg, nil)
+            return CGImageDestinationFinalize(dest) ? data as Data : nil
+        }
     }
 }
 
