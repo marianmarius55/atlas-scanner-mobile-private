@@ -15,7 +15,9 @@ struct ContentView: View {
                         showMesh: sessionManager.showMesh,
                         showPointCloud: sessionManager.showPointCloud,
                         coverage: sessionManager.coverageMap,
-                        showCoverage: sessionManager.showCoverage
+                        showCoverage: sessionManager.showCoverage,
+                        guide: sessionManager.panoramaGuide,
+                        showGuide: sessionManager.showPanoramaGuide
                     )
                     .ignoresSafeArea()
 

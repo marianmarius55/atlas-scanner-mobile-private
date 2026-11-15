@@ -42,6 +42,27 @@ final class TrajectoryRecorder {
         return PoseInterpolation.interpolate(from: before.pose, to: after.pose, t: t)
     }
 
+    /// The latest pose, or nil before the first frame.
+    func latestPose() -> simd_float4x4? {
+        lock.lock()
+        defer { lock.unlock() }
+        return poses.last?.pose
+    }
+
+    /// Every `step`-th position so far (ARKit world), for PanoramaGuide's
+    /// map of where one can stand.
+    func positions(every step: Int) -> [SIMD3<Float>] {
+        lock.lock()
+        let snapshot = poses
+        lock.unlock()
+        return Swift.stride(
+            from: 0, to: snapshot.count, by: max(1, step)
+        ).map { i in
+            let t = snapshot[i].pose.columns.3
+            return SIMD3<Float>(t.x, t.y, t.z)
+        }
+    }
+
     func nearestTimestamp(to target: Double) -> Double? {
         lock.lock()
         let snapshot = poses

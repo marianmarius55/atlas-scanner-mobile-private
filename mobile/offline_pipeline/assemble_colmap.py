@@ -377,6 +377,9 @@ def assemble_colmap(session_dir: Path, tile_size: int = 1024) -> None:
     # --- Pass 3: slice all ERPs, build image entries, unproject LiDAR ---
     image_entries: list[dict] = []
     all_pts_colmap: list[np.ndarray] = []
+    # Which points3D.bin points each scan's LiDAR gave, for mask_people.py.
+    lidar_sources: list[dict] = []
+    n_points = 0
     image_id = 1
 
     # iPhone face dir
@@ -481,6 +484,9 @@ def assemble_colmap(session_dir: Path, tile_size: int = 1024) -> None:
             pts = unproject_depth(depth_m, K_lidar, T_wc)
             if len(pts) > 0:
                 all_pts_colmap.append(pts)
+                lidar_sources.append(
+                    {"scan": scan_name, "first": n_points, "count": len(pts)})
+                n_points += len(pts)
 
         # --- iPhone depth image (project LiDAR onto iPhone tile) ---
         if all_pts_colmap:
@@ -528,6 +534,9 @@ def assemble_colmap(session_dir: Path, tile_size: int = 1024) -> None:
     merged_pts = np.vstack(all_pts_colmap) if all_pts_colmap else np.zeros((0, 3))
     write_images_bin(sparse_dir / "images.bin", image_entries)
     write_points3d_bin(sparse_dir / "points3D.bin", merged_pts)
+    (sparse_dir / "points3D_sources.json").write_text(json.dumps(
+        {"producer": "assemble_colmap.py", "total": len(merged_pts),
+         "scans": lidar_sources}, indent=1))
 
     print(f"  images.bin: {len(image_entries)} images")
     print(f"  points3D.bin: {len(merged_pts)} LiDAR points")

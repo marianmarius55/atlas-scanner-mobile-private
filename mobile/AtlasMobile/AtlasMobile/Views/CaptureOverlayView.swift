@@ -87,6 +87,12 @@ struct CaptureOverlayView: View {
                         CoverageLegend()
                     }
 
+                    // ── 360 shot guide: where to stand next ──
+                    if sessionManager.showPanoramaGuide,
+                       let hint = sessionManager.panoramaHint {
+                        PanoramaGuidePanel(hint: hint)
+                    }
+
                     // ── Camera status row ──
                     if let status = sessionManager.cameraStatus {
                         HStack(spacing: 6) {
@@ -386,6 +392,10 @@ struct CaptureOverlayView: View {
                         VisToggle(icon: "square.dashed", active: sessionManager.showCoverage) {
                             sessionManager.toggleCoverage()
                         }
+                        // 360 shot guide: where to stand, at which heights
+                        VisToggle(icon: "globe", active: sessionManager.showPanoramaGuide) {
+                            sessionManager.togglePanoramaGuide()
+                        }
                         VisToggle(
                             icon: sessionManager.showDepthOverlay ? "xmark" : "camera.filters",
                             active: sessionManager.showDepthOverlay
@@ -564,6 +574,53 @@ private struct VisToggle: View {
                 .background(.ultraThinMaterial)
                 .overlay(active ? Color.yellow.opacity(0.2) : Color.clear)
                 .clipShape(Circle())
+        }
+    }
+}
+
+/// Directions of the 360 shot guide, with the key for its dots
+/// (PanoramaGuide colours).
+private struct PanoramaGuidePanel: View {
+    let hint: PanoramaHint
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                if let degrees = hint.arrowDegrees {
+                    Image(systemName: "arrow.up")
+                        .font(.title3.weight(.bold))
+                        .foregroundColor(.cyan)
+                        .rotationEffect(.degrees(degrees))
+                }
+                Text(hint.instruction)
+                    .font(.subheadline.weight(.semibold))
+            }
+            Text(hint.detail)
+                .font(.caption)
+            HStack(spacing: 10) {
+                item(.red, "not seen")
+                item(.yellow, "1 spot")
+                item(.green, "2+ spots")
+                item(.gray, "out of reach")
+            }
+            .font(.caption2)
+        }
+        .foregroundColor(.white)
+        .lineLimit(2)
+        .minimumScaleFactor(0.7)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial)
+        .cornerRadius(8)
+    }
+
+    private func item(_ color: Color, _ label: String) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(label)
         }
     }
 }

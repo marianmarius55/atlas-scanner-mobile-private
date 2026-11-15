@@ -25,6 +25,11 @@ final class CaptureSessionManager: ObservableObject {
     /// where a sharp photo saw it too, yellow where only LiDAR frames
     /// (saved between photos) did.
     @Published var showCoverage = false
+    /// 360 shot guide: globes where to stand and at which heights, dots
+    /// coloured by how many spots see each part of the room.
+    @Published var showPanoramaGuide = false
+    /// The guide's directions, updated 4 times a second while it's shown.
+    @Published var panoramaHint: PanoramaHint?
     @Published var depthOverlayImage: UIImage?
     @Published var calibCheckImage: UIImage?
     @Published var showCalibCheck = false
@@ -35,6 +40,10 @@ final class CaptureSessionManager: ObservableObject {
     let arkitCapture = ARKitCapture()
     /// LiDAR coverage of this session, drawn by ARCameraView.
     let coverageMap = CoverageMap()
+    /// Plans the 360 shots from the LiDAR map, drawn by ARCameraView. Only
+    /// displays: it doesn't take or change any shot.
+    let panoramaGuide = PanoramaGuide()
+    private var panoramaHintTask: Task<Void, Never>?
     private var insta360Manager = Insta360CaptureManager()
     private var pipelineSink: AnyCancellable?
     private var camerasSink: AnyCancellable?
@@ -235,6 +244,8 @@ final class CaptureSessionManager: ObservableObject {
         coverageMap.reset()
         lidarFrameRecorder = LiDARFrameRecorder(
             sessionDirectory: sessionDir, coverage: coverageMap)
+        panoramaGuide.reset(
+            coverage: coverageMap, trajectory: trajectoryRecorder)
 
         arkitCapture.trajectoryRecorder = trajectoryRecorder
         arkitCapture.lidarFrameRecorder = lidarFrameRecorder
@@ -252,6 +263,7 @@ final class CaptureSessionManager: ObservableObject {
         scanCount = 0
         lastSavedScan = nil
         startDiskSpaceMonitor()
+        updatePanoramaGuide()
 
         setupDisconnectHandler()
 
@@ -396,6 +408,7 @@ final class CaptureSessionManager: ObservableObject {
                 let cmdNum = insta360CommandCount
                 sent360 = true
                 startX5HoldWindow()
+                notePanoramaShotSent()
                 let manager = insta360Manager
                 let scan = currentScan
                 let cams = activeCams
@@ -453,6 +466,8 @@ final class CaptureSessionManager: ObservableObject {
                             meanAngularRateDps:
                                 motion?.meanDps
                         )
+                    self?.notePanoramaShotResult(
+                        captureResults, meanDps: motion?.meanDps)
                     guard let self,
                           let dir = self.sessionDirectory
                     else { return }
@@ -549,6 +564,7 @@ final class CaptureSessionManager: ObservableObject {
                     }
                 }
                 startX5HoldWindow()
+                notePanoramaShotSent()
                 let cmdTime = ProcessInfo.processInfo
                     .systemUptime
                 let motionTask = Task {
@@ -604,6 +620,8 @@ final class CaptureSessionManager: ObservableObject {
                     peakAngularRateDps: m.peakDps,
                     meanAngularRateDps: m.meanDps
                 )
+                notePanoramaShotResult(
+                    insta360Results, meanDps: m.meanDps)
             }
 
             let t1 = ContinuousClock.now
@@ -747,7 +765,7 @@ final class CaptureSessionManager: ObservableObject {
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "12n"
+    private static let buildTag = "12q"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }
@@ -778,6 +796,7 @@ final class CaptureSessionManager: ObservableObject {
             logMessage(lidar.summary())
         }
         lidarFrameRecorder = nil
+        stopPanoramaGuide()
 
         let dir = sessionDirectory
 
@@ -865,8 +884,84 @@ final class CaptureSessionManager: ObservableObject {
     func toggleCoverage() {
         showCoverage.toggle()
         if showCoverage {
+            // Both draw dots on the room: one at a time.
+            if showPanoramaGuide {
+                showPanoramaGuide = false
+                updatePanoramaGuide()
+            }
             logMessage(coverageMap.summary())
         }
+    }
+
+    func togglePanoramaGuide() {
+        showPanoramaGuide.toggle()
+        if showPanoramaGuide {
+            showCoverage = false
+        }
+        updatePanoramaGuide()
+    }
+
+    /// Plans and updates the directions only while the guide is shown in
+    /// a session.
+    private func updatePanoramaGuide() {
+        let on = showPanoramaGuide && isSessionActive
+        panoramaGuide.setActive(on)
+        panoramaHintTask?.cancel()
+        panoramaHintTask = nil
+        guard on else {
+            panoramaHint = nil
+            return
+        }
+        panoramaHintTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let hint = PanoramaGuide.hint(
+                    for: self.panoramaGuide.snapshot(),
+                    phone: self.trajectoryRecorder?.latestPose())
+                if hint != self.panoramaHint {
+                    self.panoramaHint = hint
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    private func stopPanoramaGuide() {
+        panoramaGuide.setActive(false)
+        panoramaHintTask?.cancel()
+        panoramaHintTask = nil
+        panoramaHint = nil
+    }
+
+    /// Tells the guide a 360 shot was sent, from where the phone is now.
+    /// Display only: the shot itself is unchanged.
+    private func notePanoramaShotSent() {
+        guard let pose = trajectoryRecorder?.latestPose() else { return }
+        panoramaGuide.shotSent(at: SIMD3<Float>(
+            pose.columns.3.x, pose.columns.3.y, pose.columns.3.z))
+    }
+
+    /// Tells the guide how a 360 shot ended: where the camera was when the
+    /// photo was taken (the trajectory at command + x5ShutterDelay, where
+    /// the export places it) and whether the export will keep it (a photo
+    /// arrived, mean turn rate within x5MaxMeanDps).
+    private func notePanoramaShotResult(
+        _ results: [Insta360CaptureResult], meanDps: Double?
+    ) {
+        guard let first = results.first,
+              let pose = trajectoryRecorder?.interpolatePose(
+                  at: first.commandTimestamp
+                      + COLMAPExporter.x5ShutterDelay)
+        else {
+            panoramaGuide.shotFinished(nil)
+            return
+        }
+        let photo = results.contains { !$0.mediaIdentifier.isEmpty }
+        let still = (meanDps ?? 0) <= COLMAPExporter.x5MaxMeanDps
+        panoramaGuide.shotFinished(PanoramaGuide.Shot(
+            position: SIMD3<Float>(
+                pose.columns.3.x, pose.columns.3.y, pose.columns.3.z),
+            good: photo && still))
     }
 
     /// Queues a scan that saveScan has just written for the coverage view.

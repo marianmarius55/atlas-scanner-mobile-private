@@ -1,36 +1,51 @@
 """
 Atlas Mobile — Host Enhancement Server
 
-Receives session zips from the iOS app, runs the full enhancement pipeline
-(PromptDA + StableNormal + COLMAP assembly), and serves the results back.
+Receives session zips from the iOS app, runs the enhancement pipeline
+(enhance_session.py: PromptDA + StableNormal + COLMAP model + people masking
+with SAM 3 via Spirula Studio), and serves the results back.
 
 Usage:
     cd mobile/offline_pipeline
-    python3 enhance_server.py [--host 0.0.0.0] [--port 8765] [--work-dir /tmp/atlas_jobs]
+    python enhance_server.py [--host 0.0.0.0] [--port 8765] [--work-dir DIR]
+                             [--spirula PATH] [--sam-model PATH]
 
-The iOS app (HostUploader.swift) connects to this server automatically when
-"Host Processing" mode is selected. Set the host URL in the app to:
+On Windows run it with the Python that has the pipeline's packages, e.g.
+    py -3.13 enhance_server.py --work-dir C:\\atlas_jobs
+and allow it through Windows Firewall when asked (private networks).
+
+The iOS app (HostUploader.swift) connects to this server when "Host
+Processing" is selected. Set the host URL in the app to:
     http://<your-machine-ip>:8765
 
-Find your machine IP:
-    macOS:  ipconfig getifaddr en0
-    Linux:  hostname -I | awk '{print $1}'
+Find your machine IP (the server also prints its addresses):
+    Windows: ipconfig        (IPv4 Address of the Wi-Fi/Ethernet adapter)
+    macOS:   ipconfig getifaddr en0
+    Linux:   hostname -I | awk '{print $1}'
 
-Both devices must be on the same WiFi network.
+Both devices must be on the same network.
+
+People masking needs Spirula Studio and its SAM 3 checkpoint (see
+mask_people.py). The pipeline finds both on its own; --spirula and
+--sam-model choose others. Export COLMAP on the phone before uploading:
+the app's export has the 360 photos, and the pipeline masks it as it is.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import shutil
+import os
+import re
+import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import uuid
 import zipfile
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 
@@ -39,11 +54,20 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 
 _jobs: dict[str, dict] = {}  # job_id -> {status, log_lines, session_dir, result_zip}
-_work_dir = Path("/tmp/atlas_jobs")
+_work_dir = Path(tempfile.gettempdir()) / "atlas_jobs"
 
 
 def _job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def _zip_name(header: str | None) -> str:
+    """The upload's file name from X-Session-Name, reduced to a plain name
+    so a header can't write outside the job folder."""
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(header or "").name).strip("._")
+    if not name:
+        name = "session"
+    return name if name.lower().endswith(".zip") else name + ".zip"
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +77,12 @@ def _job(job_id: str) -> dict | None:
 @app.post("/upload")
 def upload():
     """Receive a session zip, unpack it, start processing in background."""
-    session_name = request.headers.get("X-Session-Name", "session")
     job_id = str(uuid.uuid4())[:8]
 
     job_dir = _work_dir / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    zip_path = job_dir / f"{session_name}"
+    zip_path = job_dir / _zip_name(request.headers.get("X-Session-Name"))
     zip_path.write_bytes(request.data)
 
     # Unzip
@@ -137,7 +160,12 @@ def _run_pipeline(job_id: str, session_dir: Path) -> None:
 
     try:
         script = Path(__file__).parent / "enhance_session.py"
-        cmd = ["python3", str(script), "--session-dir", str(session_dir)]
+        # This server's own Python: "python3" is a Microsoft Store stub on
+        # Windows, which exits with code 9009.
+        cmd = [sys.executable, str(script), "--session-dir", str(session_dir)]
+        # UTF-8 and unbuffered, so the pipeline's lines (some with ✓ and →)
+        # neither fail on Windows' default code page nor arrive in chunks.
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
 
         log(f"Starting: {' '.join(cmd)}")
         proc = subprocess.Popen(
@@ -145,7 +173,10 @@ def _run_pipeline(job_id: str, session_dir: Path) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
+            env=env,
         )
         for line in proc.stdout:
             log(line.rstrip())
@@ -179,31 +210,50 @@ def _run_pipeline(job_id: str, session_dir: Path) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _local_ipv4_addresses() -> list[str]:
+    """This machine's IPv4 addresses, for the URL to set in the app."""
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        return []
+    found = []
+    for info in infos:
+        ip = info[4][0]
+        if not ip.startswith("127.") and ip not in found:
+            found.append(ip)
+    return found
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Atlas Mobile host enhancement server")
     parser.add_argument("--host", default="0.0.0.0",
                         help="Bind address (default: 0.0.0.0 — all interfaces)")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--work-dir", type=Path, default=Path("/tmp/atlas_jobs"),
-                        help="Directory for job working files")
+    default_work_dir = Path(tempfile.gettempdir()) / "atlas_jobs"
+    parser.add_argument("--work-dir", type=Path, default=default_work_dir,
+                        help=f"Directory for job working files (default: {default_work_dir})")
+    parser.add_argument("--spirula",
+                        help="spirula executable for people masking (sets SPIRULA_EXE)")
+    parser.add_argument("--sam-model",
+                        help="SAM 3 checkpoint for people masking (sets SPIRULA_SAM_MODEL)")
     args = parser.parse_args()
 
     global _work_dir
     _work_dir = args.work_dir
     _work_dir.mkdir(parents=True, exist_ok=True)
+    # The pipeline runs as a child process and reads these.
+    if args.spirula:
+        os.environ["SPIRULA_EXE"] = str(Path(args.spirula).resolve())
+    if args.sam_model:
+        os.environ["SPIRULA_SAM_MODEL"] = str(Path(args.sam_model).resolve())
 
-    import socket
-    hostname = socket.gethostname()
-    try:
-        local_ip = socket.gethostbyname(hostname)
-    except Exception:
-        local_ip = "unknown"
-
-    print(f"Atlas Mobile Enhancement Server")
+    addresses = _local_ipv4_addresses() or ["<this-machine-ip>"]
+    print("Atlas Mobile Enhancement Server")
     print(f"  Listening on http://{args.host}:{args.port}")
-    print(f"  Local IP (set in app): http://{local_ip}:{args.port}")
+    for ip in addresses:
+        print(f"  Set in the app: http://{ip}:{args.port}")
     print(f"  Work dir: {_work_dir}")
-    print(f"  Health check: http://{local_ip}:{args.port}/health")
+    print(f"  Health check: http://{addresses[0]}:{args.port}/health")
     print()
 
     app.run(host=args.host, port=args.port, threaded=True)

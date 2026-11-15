@@ -1,10 +1,16 @@
 """
 Offline enhancement pipeline for Atlas Mobile capture sessions.
 
-Reads raw capture data from the iPhone app and produces:
+Needs the app's COLMAP export in the session (export with "COLMAP Only" on
+the phone first). Then:
 1. Dense depth maps via PromptDA (LiDAR-anchored)
 2. Surface normal maps via StableNormal
-3. Enhanced COLMAP model with dense geometry
+3. The COLMAP model: the app's export, kept as it is
+4. People masked out of the COLMAP images with SAM 3 (Spirula Studio), and
+   the LiDAR of iPhone photos with people removed (mask_people.py)
+
+Stages 1 and 2 are optional: when one fails, the others still run, and
+without PyTorch they are skipped.
 
 Usage:
     uv run python enhance_session.py --session-dir /path/to/session_YYYY-MM-DD_HH-MM-SS
@@ -15,9 +21,10 @@ from __future__ import annotations
 import argparse
 import json
 import struct
+import sys
+import traceback
 from pathlib import Path
 
-import cv2
 import numpy as np
 from PIL import Image
 
@@ -29,6 +36,8 @@ def run_prompt_da(session_dir: Path) -> None:
             raw/iphone/scan_NNN/rgb.jpg   (12MP)
     Output: enhanced/depth_dense/scan_NNN.png (uint16, mm, at RGB resolution)
     """
+    # Imported here, so the masking stage runs without OpenCV and PyTorch.
+    import cv2
     import torch
     from promptda.promptda import PromptDA  # installed from models/PromptDA
 
@@ -81,6 +90,7 @@ def run_stable_normal(session_dir: Path) -> None:
     Input:  raw/iphone/scan_NNN/rgb.jpg
     Output: enhanced/normals/scan_NNN.png (RGB-encoded world-space normals)
     """
+    import cv2
     import torch
     from stablenormal.pipeline_yoso_normal import YOSONormalsPipeline
     from stablenormal.pipeline_stablenormal import StableNormalPipeline
@@ -125,14 +135,34 @@ def run_stable_normal(session_dir: Path) -> None:
         print(f"  StableNormal: {scan_name} -> {output_path.name}")
 
 
-def assemble_colmap(session_dir: Path, tile_size: int = 1024) -> None:
-    """Stage 3: Assemble COLMAP model from raw capture data.
+def has_app_export(session_dir: Path) -> bool:
+    """True when the app's COLMAP export is in the session (colmap/sparse/0
+    and its images). A model assemble_colmap.py built (it writes
+    points3D_sources.json) doesn't count: for this app's sessions it has no
+    360 photos, the iPhone cameras face backwards and their size is
+    portrait/landscape swapped (checked on session 2026-11-14_20-55-31)."""
+    colmap = session_dir / "colmap"
+    sparse = colmap / "sparse" / "0"
+    return (
+        (sparse / "images.bin").is_file()
+        and not (sparse / "points3D_sources.json").is_file()
+        and any(p.is_file() for p in (colmap / "images").rglob("*.jpg"))
+    )
 
-    Slices Insta360 ERPs into perspective tiles, unprojects iPhone LiDAR
-    depth into world-frame point clouds, and writes the binary COLMAP model.
-    """
-    from assemble_colmap import assemble_colmap as _assemble
-    _assemble(session_dir, tile_size=tile_size)
+
+def run_stage(name: str, fn, session_dir: Path,
+              failed: list[str], skipped: list[str]) -> None:
+    """Runs an enhancement stage; a failure is logged and the rest still runs."""
+    try:
+        fn(session_dir)
+    except ModuleNotFoundError as e:
+        skipped.append(name)
+        print(f"  {name} skipped: the Python package '{e.name}' isn't "
+              "installed (setup.sh installs it)")
+    except Exception as e:  # noqa: BLE001 -- any failure of an optional stage
+        failed.append(name)
+        print(f"  {name} failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
 
 
 def main() -> None:
@@ -153,6 +183,20 @@ def main() -> None:
         action="store_true",
         help="Skip StableNormal estimation",
     )
+    parser.add_argument(
+        "--skip-people-mask",
+        action="store_true",
+        help="Skip masking people with SAM 3 (Spirula Studio)",
+    )
+    parser.add_argument(
+        "--spirula",
+        help="spirula executable (default: SPIRULA_EXE, PATH, or the newest "
+             "spirula.exe on the desktop or in Downloads)",
+    )
+    parser.add_argument(
+        "--sam-model",
+        help="SAM 3 checkpoint (default: the one Spirula Studio downloaded)",
+    )
     args = parser.parse_args()
 
     session_dir = args.session_dir
@@ -161,18 +205,44 @@ def main() -> None:
 
     print(f"Enhancing session: {session_dir}")
 
+    # The COLMAP model comes from the phone: its exporter is the only one
+    # that handles the 360 photos (dual fisheye, rig, shot timing).
+    if not has_app_export(session_dir):
+        print("This upload has no COLMAP export from the phone "
+              "(colmap/sparse/0 and colmap/images are empty).")
+        print("The server can't build the model: only the app's exporter "
+              "handles the 360 photos.")
+        print("On the phone, export with \"COLMAP Only\" first, then upload "
+              "with \"Host Processing\".")
+        sys.exit(2)
+
+    failed: list[str] = []
+    skipped: list[str] = []
+
     if not args.skip_depth:
         print("Stage 1: PromptDA depth completion")
-        run_prompt_da(session_dir)
+        run_stage("PromptDA", run_prompt_da, session_dir, failed, skipped)
 
     if not args.skip_normals:
         print("Stage 2: StableNormal estimation")
-        run_stable_normal(session_dir)
+        run_stage("StableNormal", run_stable_normal, session_dir, failed, skipped)
 
-    print("Stage 3: COLMAP model assembly")
-    assemble_colmap(session_dir, tile_size=1024)
+    print("Stage 3: COLMAP model: using the app's export (colmap/sparse/0)")
 
-    print("Done.")
+    if not args.skip_people_mask:
+        print("Stage 4: masking people (SAM 3 via Spirula Studio)")
+        from mask_people import MaskingUnavailable, mask_session
+        try:
+            mask_session(session_dir, spirula=args.spirula, sam_model=args.sam_model)
+        except MaskingUnavailable as e:
+            print(f"  skipped: {e}")
+
+    notes = []
+    if skipped:
+        notes.append("skipped " + ", ".join(skipped))
+    if failed:
+        notes.append("failed " + ", ".join(failed))
+    print("Done" + (f" ({'; '.join(notes)})." if notes else "."))
 
 
 if __name__ == "__main__":
