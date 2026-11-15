@@ -8,3 +8,5 @@ mobile/offline_pipeline/models/
 *.bin
 *.ckpt
 *.mlpackage/
+
+mobile/offline_pipeline/tools/spirula/*.exe

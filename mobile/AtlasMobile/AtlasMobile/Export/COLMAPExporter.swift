@@ -22,7 +22,8 @@ final class COLMAPExporter {
     // COLMAP camera model IDs
     private enum CameraModel: Int32 {
         case simplePinhole = 0  // f, cx, cy — Insta360 face tiles
-        case pinhole = 1        // fx, fy, cx, cy — iPhone
+        case pinhole = 1        // fx, fy, cx, cy
+        case opencv = 4         // fx, fy, cx, cy, k1, k2, p1, p2 — iPhone
         case opencvFisheye = 5  // fx, fy, cx, cy, k1, k2, k3, k4
         // fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, sx1, sy1 — the lenses of
         // a 360 photo cut at full size (Spirula's 360-camera model)
@@ -132,19 +133,37 @@ final class COLMAPExporter {
     static let x5MaxTimeMismatch: Double = 2.0
 
     /// Seed extrinsic → ERP-from-ARKit 4x4 for composing with T_wc.inverse.
-    static func erpFromARKit(_ ext: RigidTransform) -> simd_float4x4 {
+    /// The measured mount correction (MountCorrection) turns the 360
+    /// camera about its own centre unless `withMountCorrection` is false
+    /// or an on-device rig calibration was applied (it measures the same
+    /// error, against the uncorrected mount).
+    static func erpFromARKit(
+        _ ext: RigidTransform, withMountCorrection: Bool = true
+    ) -> simd_float4x4 {
         let T = ExtrinsicOptimizer.seedToCameraMatrix(ext)
         let R = simd_float3x3(
             SIMD3(T.columns.0.x, T.columns.0.y, T.columns.0.z),
             SIMD3(T.columns.1.x, T.columns.1.y, T.columns.1.z),
             SIMD3(T.columns.2.x, T.columns.2.y, T.columns.2.z)
         )
-        let Rc = R * rigCorrection * cameraFromARKit
+        var Rc = R * rigCorrection * cameraFromARKit
+        var t = SIMD3(T.columns.3.x, T.columns.3.y, T.columns.3.z)
+        if withMountCorrection,
+           rigCorrection == matrix_identity_float3x3,
+           let fix = MountCorrection.current
+        {
+            // Left of Rc is the 360 frame, which for a lens image cut
+            // with no roll (the X6) is the front lens's camera frame,
+            // where the correction was measured. Turning t with it keeps
+            // the camera centre (-Rcᵀt) where it was.
+            Rc = fix * Rc
+            t = fix * t
+        }
         var M = simd_float4x4(1)
         M.columns.0 = SIMD4(Rc.columns.0, 0)
         M.columns.1 = SIMD4(Rc.columns.1, 0)
         M.columns.2 = SIMD4(Rc.columns.2, 0)
-        M.columns.3 = T.columns.3
+        M.columns.3 = SIMD4(t, 1)
         return M
     }
 
@@ -398,6 +417,11 @@ final class COLMAPExporter {
             rcQ.real, rcQ.imag.x,
             rcQ.imag.y, rcQ.imag.z
         ))
+        let mountNote = Self.rigCorrection == matrix_identity_float3x3
+            ? MountCorrection.note
+            : "mount correction: not used (rig calibration applied)"
+        print("[Export] \(mountNote)")
+        ExportTrace.note(mountNote)
         try FileManager.default.createDirectory(
             at: sparseDir, withIntermediateDirectories: true)
 
@@ -745,12 +769,15 @@ final class COLMAPExporter {
         )
         data.appendLE(total)
 
-        // iPhone — PINHOLE: fx, fy, cx, cy
+        // iPhone — OPENCV: fx, fy, cx, cy, k1, k2, p1, p2. ARKit's frames
+        // are already undistorted, so the distortion starts at zero; the
+        // model only names a camera Spirula can't mistake for a fisheye.
         data.appendLE(iphoneCameraId)
-        data.appendLE(CameraModel.pinhole.rawValue)
+        data.appendLE(CameraModel.opencv.rawValue)
         data.appendLE(UInt64(imgW))
         data.appendLE(UInt64(imgH))
         for v in [fx, fy, cx, cy] { data.appendLE(Double(v)) }
+        for _ in 0..<4 { data.appendLE(Double(0)) }
 
         // Face tiles — SIMPLE_PINHOLE: f, cx, cy
         for (_, camId) in tileCameraIds.sorted(by: { $0.key < $1.key }) {

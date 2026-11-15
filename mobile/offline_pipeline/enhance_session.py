@@ -26,114 +26,187 @@ import sys
 import traceback
 from pathlib import Path
 
+import os
+
 import numpy as np
 from PIL import Image
 
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+# Model weights download to models/hf_cache (Hugging Face) and
+# models/torch_cache (torch.hub: StableNormal's DINOv2) unless HF_HOME and
+# TORCH_HOME say otherwise.
+os.environ.setdefault("HF_HOME", str(MODELS_DIR / "hf_cache"))
+os.environ.setdefault("TORCH_HOME", str(MODELS_DIR / "torch_cache"))
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+# ARKit's LiDAR depth map (raw/iphone/scan_NNN/depth.bin): Float32 metres,
+# 256 x 192, in the landscape sensor's orientation.
+LIDAR_W, LIDAR_H = 256, 192
+
+
+def _use_repo(name: str) -> None:
+    """Puts models/<name> (a checkout of the model's repository) first on
+    the import path. The repos pin old torch and numpy versions, so they are
+    imported from the checkout rather than pip-installed."""
+    repo = MODELS_DIR / name
+    if not repo.is_dir():
+        raise ModuleNotFoundError(f"models/{name} is missing", name=name)
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+
+
+def _scans(session_dir: Path) -> list[Path]:
+    """The raw/iphone/scan_NNN folders to process: the iPhone photos the
+    phone's COLMAP export kept (colmap/images/face_iphone), else all."""
+    raw_dir = session_dir / "raw" / "iphone"
+    exported = session_dir / "colmap" / "images" / "face_iphone"
+    if exported.is_dir():
+        names = sorted(p.stem for p in exported.glob("*.jpg"))
+        return [raw_dir / n for n in names if (raw_dir / n).is_dir()]
+    return sorted(raw_dir.glob("scan_*"))
+
 
 def run_prompt_da(session_dir: Path) -> None:
-    """Stage 1: Depth completion with PromptDA.
+    """Stage 1: Depth completion with PromptDA (Prompt Depth Anything).
 
-    Input:  raw/iphone/scan_NNN/depth.bin (Float32, 256x192, metres)
-            raw/iphone/scan_NNN/rgb.jpg   (12MP)
+    Input:  raw/iphone/scan_NNN/depth.bin (the LiDAR prompt)
+            raw/iphone/scan_NNN/rgb.jpg   (portrait: the landscape sensor
+                                           image turned 90 degrees clockwise)
     Output: enhanced/depth_dense/scan_NNN.png (uint16, mm, at RGB resolution)
+
+    The image goes in as the repo's load_image prepares it: RGB 0..1, the
+    longer side at most 1008 px and both sides a multiple of 14. The prompt
+    goes in at its own 256 x 192 (the model resizes it), turned like the
+    photo.
     """
     # Imported here, so the masking stage runs without OpenCV and PyTorch.
     import cv2
     import torch
-    from promptda.promptda import PromptDA  # installed from models/PromptDA
+    _use_repo("PromptDA")
+    from promptda.promptda import PromptDA
 
-    raw_dir    = session_dir / "raw" / "iphone"
     output_dir = session_dir / "enhanced" / "depth_dense"
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Photos without a depth map yet; with none the model isn't loaded.
+    todo = [d for d in _scans(session_dir)
+            if (d / "rgb.jpg").exists() and (d / "depth.bin").exists()
+            and not (output_dir / f"{d.name}.png").exists()]
+    if not todo:
+        print(f"  PromptDA: every depth map is already done ({output_dir})")
+        return
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  PromptDA device: {device}")
+    print(f"  PromptDA device: {device}, {len(todo)} photos to do")
     model = PromptDA.from_pretrained("depth-anything/promptda_vitl").to(device).eval()
 
-    scan_dirs = sorted(raw_dir.glob("scan_*"))
-    for scan_dir in scan_dirs:
+    max_size, multiple = 1008, 14
+    done = 0
+    for scan_dir in todo:
         rgb_path   = scan_dir / "rgb.jpg"
         depth_path = scan_dir / "depth.bin"
-        if not rgb_path.exists() or not depth_path.exists():
-            continue
-
         scan_name   = scan_dir.name
         output_path = output_dir / f"{scan_name}.png"
-        if output_path.exists():
-            print(f"  PromptDA: {scan_name} already done, skipping")
-            continue
 
-        # Load RGB
-        rgb = Image.open(rgb_path).convert("RGB")
-        rgb_w, rgb_h = rgb.size
+        rgb = np.asarray(Image.open(rgb_path).convert("RGB"), dtype=np.float32) / 255.0
+        rgb_h, rgb_w = rgb.shape[:2]
+        scale = min(1.0, max_size / max(rgb_h, rgb_w))
+        tar_h = int(rgb_h * scale // multiple * multiple)
+        tar_w = int(rgb_w * scale // multiple * multiple)
+        image = cv2.resize(rgb, (tar_w, tar_h), interpolation=cv2.INTER_AREA)
 
-        # Load sparse LiDAR depth (Float32, 256x192, metres)
         raw = np.frombuffer(depth_path.read_bytes(), dtype=np.float32)
-        sparse = raw[: 256 * 192].reshape(192, 256)
-        # Resize sparse depth to RGB resolution for PromptDA prompt input
-        sparse_resized = cv2.resize(sparse, (rgb_w, rgb_h), interpolation=cv2.INTER_NEAREST)
+        if raw.size < LIDAR_W * LIDAR_H:
+            print(f"  PromptDA: {scan_name} has no full depth map, skipping")
+            continue
+        prompt = raw[: LIDAR_W * LIDAR_H].reshape(LIDAR_H, LIDAR_W)
+        if rgb_h > rgb_w:
+            prompt = np.rot90(prompt, k=-1)   # clockwise, like the photo
+        prompt = np.nan_to_num(np.ascontiguousarray(prompt), nan=0.0)
 
         with torch.no_grad():
-            depth_pred = model.predict(
-                image=rgb,
-                prompt_depth=torch.from_numpy(sparse_resized).unsqueeze(0).unsqueeze(0).to(device),
-            )  # returns (1, 1, H, W) tensor in metres
+            depth = model.predict(
+                torch.from_numpy(image).permute(2, 0, 1)[None].to(device),
+                torch.from_numpy(prompt.copy())[None, None].to(device),
+            )  # (1, 1, tar_h, tar_w), metres
 
-        depth_m = depth_pred.squeeze().cpu().numpy()  # (H, W) float32, metres
+        depth_m = depth.squeeze().float().cpu().numpy()
+        depth_m = cv2.resize(depth_m, (rgb_w, rgb_h), interpolation=cv2.INTER_LINEAR)
         depth_mm = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
         cv2.imwrite(str(output_path), depth_mm)
-        print(f"  PromptDA: {scan_name} -> {output_path.name}")
+        done += 1
+        if done % 10 == 0:
+            print(f"  PromptDA: {done} depth maps")
+    print(f"  PromptDA: {done} depth maps written to {output_dir}")
+
+
+def _diffusers_compat() -> None:
+    """The StableNormal models' own code (controlnetvae.py in both Hugging
+    Face repos, loaded with trust_remote_code) imports ControlNetOutput from
+    diffusers.models.controlnet, which newer diffusers moved to
+    diffusers.models.controlnets.controlnet. The old name is pointed at the
+    new module."""
+    import importlib
+    old, new = "diffusers.models.controlnet", "diffusers.models.controlnets.controlnet"
+    try:
+        importlib.import_module(old)
+    except ModuleNotFoundError:
+        sys.modules[old] = importlib.import_module(new)
 
 
 def run_stable_normal(session_dir: Path) -> None:
     """Stage 2: Normal estimation with StableNormal.
 
     Input:  raw/iphone/scan_NNN/rgb.jpg
-    Output: enhanced/normals/scan_NNN.png (RGB-encoded world-space normals)
-    """
-    import cv2
-    import torch
-    from stablenormal.pipeline_yoso_normal import YOSONormalsPipeline
-    from stablenormal.pipeline_stablenormal import StableNormalPipeline
+    Output: enhanced/normals/scan_NNN.png (camera-space normals as RGB,
+            [-1, 1] mapped to 0..255, at RGB resolution)
 
-    raw_dir    = session_dir / "raw" / "iphone"
+    The model is the repo's own entry point (hubconf.StableNormal: the YOSO
+    pass and the diffusion pass, fp16), run on the GPU at its 1024 px.
+    """
+    import torch
+    _use_repo("StableNormal")
+    import hubconf  # models/StableNormal/hubconf.py
+
     output_dir = session_dir / "enhanced" / "normals"
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Photos without a normal map yet; with none nothing is downloaded or
+    # loaded.
+    todo = [d for d in _scans(session_dir)
+            if (d / "rgb.jpg").exists()
+            and not (output_dir / f"{d.name}.png").exists()]
+    if not todo:
+        print(f"  StableNormal: every normal map is already done ({output_dir})")
+        return
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  StableNormal device: {device}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("StableNormal runs in fp16 and needs a CUDA GPU")
+    print(f"  StableNormal device: cuda, {len(todo)} photos to do")
+    print("  StableNormal: getting the model weights (7.4 GB the first time,"
+          " plus 1.2 GB for DINOv2; a stopped download resumes)")
+    # hubconf joins "Stable-X" and the model name with os.path.join, which
+    # on Windows makes "Stable-X\\yoso-normal-v0-3", not a Hugging Face id.
+    # So both models are downloaded into one folder and loaded from there.
+    from huggingface_hub import snapshot_download
+    local = MODELS_DIR / "stable_x"
+    for repo in ("yoso-normal-v0-3", "stable-normal-v0-1"):
+        # The fp16 weights only, which is what hubconf loads (variant
+        # "fp16"): 7.4 GB instead of 15.5.
+        snapshot_download(repo_id=f"Stable-X/{repo}", local_dir=local / repo,
+                          ignore_patterns=["*.bin"])
+    _diffusers_compat()
+    predictor = hubconf.StableNormal(local_cache_dir=str(local), device="cuda:0")
 
-    # Two-step pipeline: coarse YOSO pass → refined diffusion pass
-    yoso = YOSONormalsPipeline.from_pretrained(
-        "Stable-X/yoso-normal-v0-3", trust_remote_code=True
-    ).to(device)
-    pipe = StableNormalPipeline.from_pretrained(
-        "Stable-X/stable-normal-v0-1", trust_remote_code=True,
-        yoso_version=yoso,
-    ).to(device)
-
-    scan_dirs = sorted(raw_dir.glob("scan_*"))
-    for scan_dir in scan_dirs:
+    done = 0
+    for scan_dir in todo:
         rgb_path = scan_dir / "rgb.jpg"
-        if not rgb_path.exists():
-            continue
-
-        scan_name   = scan_dir.name
-        output_path = output_dir / f"{scan_name}.png"
-        if output_path.exists():
-            print(f"  StableNormal: {scan_name} already done, skipping")
-            continue
-
+        output_path = output_dir / f"{scan_dir.name}.png"
         rgb = Image.open(rgb_path).convert("RGB")
-        with torch.no_grad():
-            result = pipe(rgb, match_input_resolution=True)
-
-        # result.prediction is (H, W, 3) float32 in [-1, 1]
-        normal = result.prediction
-        # Encode to uint8 RGB: map [-1,1] → [0,255]
-        normal_rgb = ((normal * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
-        cv2.imwrite(str(output_path), cv2.cvtColor(normal_rgb, cv2.COLOR_RGB2BGR))
-        print(f"  StableNormal: {scan_name} -> {output_path.name}")
+        normal = predictor(rgb, resolution=1024, data_type="indoor")
+        normal.save(output_path)
+        done += 1
+        if done % 10 == 0:
+            print(f"  StableNormal: {done} normal maps")
+    print(f"  StableNormal: {done} normal maps written to {output_dir}")
 
 
 def has_app_export(session_dir: Path) -> bool:
@@ -157,9 +230,17 @@ def run_stage(name: str, fn, session_dir: Path,
     try:
         fn(session_dir)
     except ModuleNotFoundError as e:
-        skipped.append(name)
-        print(f"  {name} skipped: the Python package '{e.name}' isn't "
-              "installed (setup.sh installs it)")
+        missing = e.name or str(e)
+        if "." in missing:
+            # A module the installed package doesn't have: another version
+            # than the code was written for.
+            failed.append(name)
+            print(f"  {name} failed: the installed {missing.split('.')[0]} has "
+                  f"no module '{missing}' (the code expects another version)")
+            traceback.print_exc()
+        else:
+            skipped.append(name)
+            print(f"  {name} skipped: the Python package '{missing}' isn't installed")
     except Exception as e:  # noqa: BLE001 -- any failure of an optional stage
         failed.append(name)
         print(f"  {name} failed: {type(e).__name__}: {e}")

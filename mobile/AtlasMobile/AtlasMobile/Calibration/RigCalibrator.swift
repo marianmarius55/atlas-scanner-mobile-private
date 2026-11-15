@@ -620,7 +620,10 @@ final class RigCalibrator {
         // ── Phase 6: Fit rig correction ───────────────────
         log("phase 6: fit correction")
 
-        let T_erp = COLMAPExporter.erpFromARKit(camCfg.extrinsic)
+        // Measured against the uncorrected mount: an applied result
+        // replaces the mount correction (see erpFromARKit).
+        let T_erp = COLMAPExporter.erpFromARKit(
+            camCfg.extrinsic, withMountCorrection: false)
         let R_erp = ext3x3(T_erp)
         let t_erp = SIMD3<Float>(
             T_erp.columns.3.x, T_erp.columns.3.y,
@@ -888,7 +891,8 @@ final class RigCalibrator {
         delay: Double
     ) -> SIMD3<Float> {
         let x5 = interpX5(scan: scan, traj: traj, delay: delay)
-        let T = COLMAPExporter.erpFromARKit(cam.extrinsic)
+        let T = COLMAPExporter.erpFromARKit(
+            cam.extrinsic, withMountCorrection: false)
         let Re = ext3x3(T)
         let Ri = ext3x3(x5.inverse)
         let Rc = Re * COLMAPExporter.arkitToColmap

@@ -95,10 +95,14 @@ class LidarLayoutError(RuntimeError):
 # Finding Spirula and the model
 # ---------------------------------------------------------------------------
 
+TOOLS_SPIRULA = Path(__file__).resolve().parent / "tools" / "spirula"
+
+
 def find_spirula(explicit: str | None = None) -> Path:
-    """--spirula, then SPIRULA_EXE, then PATH, then the newest spirula.exe
-    on the desktop or in Downloads (the Windows release is a zip you unzip
-    and run, so it is wherever it was unzipped)."""
+    """--spirula, then SPIRULA_EXE, then the copy in tools/spirula/ beside
+    this script, then PATH, then the newest spirula.exe on the desktop or in
+    Downloads (the Windows release is a zip you unzip and run, so it is
+    wherever it was unzipped)."""
     for given, what in ((explicit, "--spirula"),
                         (os.environ.get("SPIRULA_EXE"), "SPIRULA_EXE")):
         if given:
@@ -106,10 +110,12 @@ def find_spirula(explicit: str | None = None) -> Path:
             if path.is_file():
                 return path
             raise MaskingUnavailable(f"{what} points at {path}, which doesn't exist")
+    exe = "spirula.exe" if os.name == "nt" else "spirula"
+    if (TOOLS_SPIRULA / exe).is_file():
+        return TOOLS_SPIRULA / exe
     on_path = shutil.which("spirula")
     if on_path:
         return Path(on_path)
-    exe = "spirula.exe" if os.name == "nt" else "spirula"
     found: list[Path] = []
     for base in (Path.home() / "Desktop", Path.home() / "Downloads"):
         found += [p for p in [base / exe, *base.glob(f"spirula*/{exe}")] if p.is_file()]

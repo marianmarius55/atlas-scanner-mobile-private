@@ -16,6 +16,16 @@ struct CameraSettingsView: View {
     private var coverageSpacing = PanoramaGuide.Route.coverage.defaultSpacing
     @AppStorage(PanoramaGuide.Route.loops.spacingKey)
     private var loopsSpacing = PanoramaGuide.Route.loops.defaultSpacing
+    /// The measured mount correction (MountCorrection) the export adds to
+    /// the Mount Rotation.
+    @AppStorage(MountCorrection.enabledKey)
+    private var mountFixOn = true
+    @AppStorage(MountCorrection.xKey)
+    private var mountFixX = MountCorrection.measured.x
+    @AppStorage(MountCorrection.yKey)
+    private var mountFixY = MountCorrection.measured.y
+    @AppStorage(MountCorrection.zKey)
+    private var mountFixZ = MountCorrection.measured.z
 
     var body: some View {
         List {
@@ -38,6 +48,8 @@ struct CameraSettingsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+
+            mountCorrectionSection
 
             Section("Configured Cameras") {
                 if config.cameras.isEmpty {
@@ -157,6 +169,33 @@ struct CameraSettingsView: View {
                 config = MultiCameraConfig(cameras: cameras, iphone: config.iphone)
                 save()
             }
+        }
+    }
+
+    private var mountCorrectionSection: some View {
+        Section("Measured Mount Correction") {
+            Toggle("Apply to 360 exports", isOn: $mountFixOn)
+            if mountFixOn {
+                NumberField("About x, right (\u{00B0})", value: $mountFixX)
+                NumberField("About y, down (\u{00B0})", value: $mountFixY)
+                NumberField("About z, forward (\u{00B0})", value: $mountFixZ)
+                let total = MountCorrection.angleDegrees(
+                    SIMD3(mountFixX, mountFixY, mountFixZ))
+                Text(String(format: "Total turn: %.2f\u{00B0}", total))
+                    .font(.subheadline)
+                Button("Reset to measured value") {
+                    mountFixX = MountCorrection.measured.x
+                    mountFixY = MountCorrection.measured.y
+                    mountFixZ = MountCorrection.measured.z
+                }
+            }
+            Text(MountCorrection.measuredNote
+                 + " Added on top of the Mount Rotation, as a rotation"
+                 + " vector in the 360 front lens's camera frame. Not used"
+                 + " when an export's rig calibration is applied. Turn it"
+                 + " off or measure again after re-mounting the camera.")
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
     }
 
